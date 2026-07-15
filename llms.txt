@@ -1,0 +1,178 @@
+# yii3-correlation-id
+
+Request correlation ID for Yii3: PSR-15 middleware, request-scoped holder,
+yiisoft/log context provider. Single-service log correlation — not distributed
+tracing (that is `rasuvaeff/yii3-telemetry`).
+
+Install:
+
+```
+composer require rasuvaeff/yii3-correlation-id
+```
+
+## Rules
+
+- PHP 8.3+, `declare(strict_types=1)`, namespace `Rasuvaeff\Yii3CorrelationId`
+- `CorrelationIdHolder` must be ONE shared instance (DI autowires it; the
+  package deliberately does not bind it). Different instances = the middleware
+  writes one holder and readers read another, silently empty.
+- Application services inject read-only `CorrelationIdProvider`; mutation on
+  `CorrelationIdHolder` is reserved for middleware and scope infrastructure.
+- Incoming IDs are reused only if they match `validationPattern` and are no
+  longer than `maxLength`; otherwise a new ID is generated. Generated IDs must
+  satisfy the same contract or the middleware throws before calling the handler.
+- A custom ID format needs a custom generator, matching pattern, and sufficient
+  `maxLength`.
+- Use `acceptIncoming: false` at a public trust boundary that mints IDs. Trusted
+  internal services normally keep it true to preserve the gateway ID.
+- The middleware clears the holder in `finally`. Correct for FPM and
+  one-request-at-a-time workers; not for Swoole coroutines.
+- `Yiisoft\Log\ContextProvider\ContextProviderInterface` is never bound by this
+  package — the application composes providers.
+- `CorrelationIdHeaderInjector` replaces the configured header on outgoing
+  PSR-7 requests, or returns the same request when no scope is active.
+- `IncomingCorrelationIdPolicy` sees only format-valid IDs. Returning false
+  regenerates; `acceptIncoming: false` skips the policy and always regenerates.
+
+## API
+
+### CorrelationIdMiddleware
+
+```php
+use Rasuvaeff\Yii3CorrelationId\CorrelationIdHolder;
+use Rasuvaeff\Yii3CorrelationId\CorrelationIdMiddleware;
+use Rasuvaeff\Yii3CorrelationId\Uuidv4Generator;
+
+$holder = new CorrelationIdHolder();
+
+$middleware = new CorrelationIdMiddleware(
+    generator: new Uuidv4Generator(),
+    holder: $holder,
+    headerName: 'X-Request-ID',           // default
+    attributeName: 'correlationId',       // default
+    acceptIncoming: true,                 // false = mint here, e.g. public gateway
+    validationPattern: CorrelationIdMiddleware::UUID_V4_PATTERN, // default
+    maxLength: 128,                       // default
+);
+
+// Per request: read/generate ID -> request attribute + holder -> handler ->
+// clear holder (finally) -> X-Request-ID on the response.
+$response = $middleware->process($request, $handler);
+$id = $response->getHeaderLine('X-Request-ID');
+```
+
+Throws `InvalidArgumentException` from the constructor when `maxLength < 1` or
+`validationPattern` is not a valid regex. Throws `UnexpectedValueException`
+before calling the handler if the generator returns an unacceptable ID.
+
+### CorrelationIdHolder
+
+```php
+$holder->set('id');       // set-once; second set() throws LogicException
+$holder->override('id');  // low-level replacement; prefer runWith() for scopes
+$holder->get();           // string; throws CorrelationIdNotSetException if unset
+$holder->tryGet();        // ?string
+$holder->clear();         // reopens set() for the next request
+$holder->runWith('id', fn () => $work()); // restores previous scope in finally
+```
+
+Inject `CorrelationIdProvider` into application services when only `get()` and
+`tryGet()` are required.
+
+### Reading the ID in an action
+
+```php
+$id = $request->getAttribute('correlationId');  // with the request in hand
+$id = $correlationId->tryGet();                 // anywhere else, via provider DI
+```
+
+### CorrelationIdGenerator / Uuidv4Generator
+
+```php
+use Rasuvaeff\Yii3CorrelationId\CorrelationIdGenerator;
+
+final readonly class UlidLikeGenerator implements CorrelationIdGenerator
+{
+    #[\Override]
+    public function generate(): string
+    {
+        return $ulid;
+    }
+}
+
+// Pattern must accept what the generator emits:
+new CorrelationIdMiddleware(
+    generator: new UlidLikeGenerator(),
+    holder: $holder,
+    validationPattern: '/^[0-9A-HJKMNP-TV-Z]{26}$/',
+    maxLength: 26,
+);
+```
+
+`Uuidv4Generator::generate()` returns an RFC 4122 v4 UUID built from
+`random_bytes(16)`. No ext-uuid, no ramsey/uuid.
+
+### CorrelationIdContextProvider (yiisoft/log)
+
+```php
+use Rasuvaeff\Yii3CorrelationId\CorrelationIdContextProvider;
+use Yiisoft\Log\ContextProvider\CompositeContextProvider;
+use Yiisoft\Log\ContextProvider\SystemContextProvider;
+use Yiisoft\Log\Logger;
+use Yiisoft\Log\StreamTarget;
+
+$logger = new Logger(
+    [new StreamTarget()],
+    new CompositeContextProvider(
+        new SystemContextProvider(),                    // keep it: time/category/trace
+        new CorrelationIdContextProvider($holder),      // adds requestId
+    ),
+);
+
+$logger->info('order placed');  // context: [..., 'requestId' => '...']
+```
+
+`getContext()` returns `['requestId' => $id]`, or `[]` when no ID is set
+(console, worker bootstrap) — it never throws. The context key is configurable:
+`new CorrelationIdContextProvider($holder, contextKey: 'request_id')`.
+
+### Outgoing propagation
+
+```php
+$injector = new CorrelationIdHeaderInjector($provider, headerName: 'X-Request-ID');
+$request = $injector->inject($request); // overwrites stale header; no-op if unset
+```
+
+### Incoming policy
+
+```php
+final readonly class TrustedProxyPolicy implements IncomingCorrelationIdPolicy
+{
+    #[\Override]
+    public function accepts(ServerRequestInterface $request, string $id): bool
+    {
+        return ($request->getServerParams()['REMOTE_ADDR'] ?? null) === '10.0.0.10';
+    }
+}
+
+return [IncomingCorrelationIdPolicy::class => TrustedProxyPolicy::class];
+```
+
+For browser access to the response ID, expose the configured header through
+CORS: `Access-Control-Expose-Headers: X-Request-ID`.
+
+### config-plugin
+
+`config/di.php` binds `CorrelationIdGenerator => Uuidv4Generator` and configures
+`CorrelationIdMiddleware` + `CorrelationIdContextProvider` from `config/params.php`:
+
+```php
+'rasuvaeff/yii3-correlation-id' => [
+    'headerName' => 'X-Request-ID',
+    'attributeName' => 'correlationId',
+    'acceptIncoming' => true,
+    'validationPattern' => CorrelationIdMiddleware::UUID_V4_PATTERN,
+    'maxLength' => 128,
+    'contextKey' => 'requestId',
+],
+```

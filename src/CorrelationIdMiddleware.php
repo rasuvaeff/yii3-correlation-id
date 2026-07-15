@@ -1,0 +1,112 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Rasuvaeff\Yii3CorrelationId;
+
+use InvalidArgumentException;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\MiddlewareInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+use UnexpectedValueException;
+
+/**
+ * Gives every request a correlation ID: reuses an acceptable incoming one,
+ * generates a fresh one otherwise, publishes it via the request attribute and
+ * the holder, and echoes it back in the response header.
+ *
+ * Place it first in the stack — everything downstream that logs should already
+ * see the ID.
+ *
+ * @api
+ */
+final readonly class CorrelationIdMiddleware implements MiddlewareInterface
+{
+    public const string UUID_V4_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i';
+
+    /**
+     * @param string $headerName Read from the request and written to the response.
+     * @param string $attributeName Request attribute carrying the ID downstream.
+     * @param bool $acceptIncoming Whether a caller-sent ID may be reused. Set it
+     * to false at a public trust boundary that must mint its own ID. Services
+     * behind a trusted gateway normally keep it true to preserve propagation.
+     * @param non-empty-string $validationPattern Incoming and generated IDs must
+     * match this pattern.
+     * @param int $maxLength Incoming and generated IDs may not exceed this length.
+     * @param IncomingCorrelationIdPolicy $incomingPolicy Trust decision applied
+     * after an incoming ID passes format and length validation.
+     *
+     * @throws InvalidArgumentException When the pattern is not a valid regex or maxLength is below 1.
+     */
+    public function __construct(
+        private CorrelationIdGenerator $generator,
+        private CorrelationIdHolder $holder,
+        private string $headerName = 'X-Request-ID',
+        private string $attributeName = 'correlationId',
+        private bool $acceptIncoming = true,
+        private string $validationPattern = self::UUID_V4_PATTERN,
+        private int $maxLength = 128,
+        private IncomingCorrelationIdPolicy $incomingPolicy = new AcceptAllIncomingCorrelationIdPolicy(),
+    ) {
+        if ($maxLength < 1) {
+            throw new InvalidArgumentException("Max length must be at least 1, got {$maxLength}");
+        }
+
+        if (@preg_match($validationPattern, '') === false) {
+            throw new InvalidArgumentException("Invalid validation pattern \"{$validationPattern}\"");
+        }
+    }
+
+    /**
+     * @throws UnexpectedValueException When the generator returns an ID that
+     * does not satisfy validationPattern or maxLength.
+     */
+    #[\Override]
+    public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
+    {
+        $id = $this->resolveId($request);
+        $this->holder->set($id);
+
+        try {
+            $response = $handler->handle($request->withAttribute($this->attributeName, $id));
+        } finally {
+            $this->holder->clear();
+        }
+
+        return $response->withHeader($this->headerName, $id);
+    }
+
+    private function resolveId(ServerRequestInterface $request): string
+    {
+        if (!$this->acceptIncoming) {
+            return $this->generateId();
+        }
+
+        $incoming = $request->getHeaderLine($this->headerName);
+
+        return $this->isAcceptable($incoming) && $this->incomingPolicy->accepts($request, $incoming)
+            ? $incoming
+            : $this->generateId();
+    }
+
+    private function generateId(): string
+    {
+        $id = $this->generator->generate();
+
+        if (!$this->isAcceptable($id)) {
+            throw new UnexpectedValueException('Generated correlation ID does not satisfy validationPattern and maxLength');
+        }
+
+        return $id;
+    }
+
+    private function isAcceptable(string $id): bool
+    {
+        // An absent header reads as an empty string; a permissive custom pattern
+        // could otherwise accept it as the correlation ID.
+        return $id !== ''
+            && strlen($id) <= $this->maxLength
+            && preg_match($this->validationPattern, $id) === 1;
+    }
+}
