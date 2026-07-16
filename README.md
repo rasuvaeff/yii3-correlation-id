@@ -7,6 +7,7 @@
 [![Psalm level](https://img.shields.io/badge/psalm-level_1-blue.svg)](https://github.com/rasuvaeff/yii3-correlation-id/actions/workflows/static-analysis.yml)
 [![PHP](https://img.shields.io/packagist/dependency-v/rasuvaeff/yii3-correlation-id/php)](https://packagist.org/packages/rasuvaeff/yii3-correlation-id)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE.md)
+[Русская версия](README.ru.md)
 
 Request correlation ID for Yii3: PSR-15 middleware, request-scoped holder, and
 yiisoft/log context provider. Every request gets an ID, every log line carries
