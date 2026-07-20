@@ -1,4 +1,5 @@
 # rasuvaeff/yii3-correlation-id
+
 [![Latest Stable Version](https://poser.pugx.org/rasuvaeff/yii3-correlation-id/v)](https://packagist.org/packages/rasuvaeff/yii3-correlation-id)
 [![Total Downloads](https://poser.pugx.org/rasuvaeff/yii3-correlation-id/downloads)](https://packagist.org/packages/rasuvaeff/yii3-correlation-id)
 [![Build](https://github.com/rasuvaeff/yii3-correlation-id/actions/workflows/build.yml/badge.svg)](https://github.com/rasuvaeff/yii3-correlation-id/actions/workflows/build.yml)
@@ -6,23 +7,32 @@
 [![Psalm level](https://img.shields.io/badge/psalm-level_1-blue.svg)](https://github.com/rasuvaeff/yii3-correlation-id/actions/workflows/static-analysis.yml)
 [![PHP](https://img.shields.io/packagist/dependency-v/rasuvaeff/yii3-correlation-id/php)](https://packagist.org/packages/rasuvaeff/yii3-correlation-id)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE.md)
-Идентификатор корреляции запроса для Yii3: промежуточное программное обеспечение PSR-15, держатель области запроса и поставщик контекста
- yiisoft/log. Каждый запрос получает идентификатор, каждая строка журнала содержит его
-, и клиент получает его обратно в заголовке ответа.
+[English version](README.md)
 
- > Используете помощника по программированию с искусственным интеллектом? [llms.txt](llms.txt) содержит компактную ссылку на API, которой вы можете поделиться с моделью. @@ЛИНИЯ@@
+Correlation ID запроса для Yii3: PSR-15-middleware, request-scoped holder и
+context-провайдер `yiisoft/log`. Каждый запрос получает ID, каждая строка
+лога несёт его, а клиент получает его обратно в заголовке ответа.
+
+> Используете AI-ассистента? [llms.txt](llms.txt) содержит компактный
+> API-справочник, которым можно поделиться с моделью.
+
 ## Требования
+
 - PHP 8.3+
- - `psr/http-message` ^2.0, `psr/http-server-middleware` ^1.0
- - `yiisoft/log` ^2.1 (в версии 2.1.0 появился API `ContextProvider`)
+- `psr/http-message` ^2.0, `psr/http-server-middleware` ^1.0
+- `yiisoft/log` ^2.1 (API `ContextProvider` появился в 2.1.0)
 
 ## Установка
+
 ```bash
 composer require rasuvaeff/yii3-correlation-id
 ```
+
 ## Использование
-Сначала поместите CorrelationIdMiddleware в стек — все последующие элементы, которые регистрирует
-, уже должны видеть этот идентификатор. @@ЛИНИЯ@@
+
+Поставьте `CorrelationIdMiddleware` первым в стеке — всё, что ниже по потоку и
+пишет логи, уже должно видеть ID.
+
 ```php
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdHolder;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdMiddleware;
@@ -33,20 +43,21 @@ $middleware = new CorrelationIdMiddleware(
     holder: new CorrelationIdHolder(),
 );
 ```
-Для каждого запроса промежуточное программное обеспечение:
 
- 1. Считывает `X-Request-ID` и повторно использует значение, если оно приемлемо.
- 2. В противном случае генерирует UUIDv4.
- 3. Публикует идентификатор как атрибут запроса `correlationId`.
- 4. Публикует идентификатор в CorrelationIdHolder.
- 5. Очищает держатель в блоке «finally».
- 6. Устанавливает `X-Request-ID` в ответе.
+Для каждого запроса middleware:
 
- В `yiisoft/config` входящий в комплект `config/di.php` связывает всё это с
- `params.php`, так что промежуточное программное обеспечение нужно только добавить в ваш стек промежуточного программного обеспечения.
+1. Читает `X-Request-ID` и переиспользит значение, если оно допустимо.
+2. Иначе генерирует UUIDv4.
+3. Публикует ID как request-атрибут `correlationId`.
+4. Публикует ID в `CorrelationIdHolder`.
+5. Очищает holder в блоке `finally`.
+6. Устанавливает `X-Request-ID` в ответе.
 
- Для приложения Yii3 поместите идентификатор контейнера первым в списке промежуточного программного обеспечения
- веб-раннера (точное имя файла зависит от шаблона приложения):
+Под `yiisoft/config` поставляемый `config/di.php` собирает всё это из
+`params.php`, поэтому middleware нужно лишь добавить в стек.
+
+Для Yii3-приложения поставьте container ID первым в списке middleware
+web-раннера (точное имя файла зависит от шаблона приложения):
 
 ```php
 // config/web.php or config/common/middleware.php
@@ -60,8 +71,9 @@ return [
     Router::class,
 ];
 ```
-Переопределить значения пакета по умолчанию на уровне параметров приложения без копирования определений DI поставщика
-:
+
+Перекройте дефолты пакета в слое параметров приложения, не копируя
+vendor-DI-определения:
 
 ```php
 // config/common/params.php
@@ -78,9 +90,11 @@ return [
     ],
 ];
 ```
-### Чтение идентификатора
-Все, что содержит запрос, считывает атрибут; службы приложений внедряют
- объект CorrelationIdProvider, доступный только для чтения:
+
+### Чтение ID
+
+Любой, кто держит запрос, читает атрибут; сервисы приложения инжектят
+read-only `CorrelationIdProvider`:
 
 ```php
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdProvider;
@@ -97,14 +111,17 @@ final readonly class OrderService
 $id = $correlationId->get();     // throws outside a correlation scope
 $id = $correlationId->tryGet();  // null outside a correlation scope
 ```
-`CorrelationIdHolder` должен оставаться **единственным общим экземпляром** — промежуточное программное обеспечение
- записывает его, а все остальное читает. Контейнер `yiisoft/di` делает это посредством автоматического подключения
-. Пакет использует псевдоним CorrelationIdProvider для того же экземпляра; Сервисы приложений
- не должны зависеть от методов мутации владельца. @@ЛИНИЯ@@
+
+`CorrelationIdHolder` должен оставаться **единым shared-инстансом** — middleware
+пишет в него, всё остальное читает. Контейнер `yiisoft/di` делает это через
+autowiring. Пакет алиасит `CorrelationIdProvider` на тот же инстанс; сервисы
+приложения не должны зависеть от мутабельных методов holder'а.
+
 ### Области очереди и консоли
-Потребители очереди и консольные команды могут устанавливать явную область без ручной очистки
-. `runWith()` восстанавливает предыдущий идентификатор в `finally`, включая
- для вложенных областей и исключений:
+
+Потребители очереди и консольные команды могут устанавливать явную область без
+ручной очистки. `runWith()` восстанавливает предыдущий ID в `finally`, включая
+вложенные области и исключения:
 
 ```php
 $result = $holder->runWith(
@@ -112,24 +129,32 @@ $result = $holder->runWith(
     callback: fn () => $consumer->handle($message),
 );
 ```
-Идентификаторы областей поступают из доверенной инфраструктуры приложений и обходят настройки проверки HTTP
-. Не передавайте произвольный пользовательский ввод в `runWith()`. @@ЛИНИЯ@@
+
+ID области приходят из доверенной инфраструктуры приложения и обходят
+HTTP-настройки валидации. Не передавайте произвольный пользовательский ввод в
+`runWith()`.
+
 ### Исходящие HTTP-запросы
-`CorrelationIdHeaderInjector` передает текущий идентификатор в исходящий запрос PSR-7
-. Он заменяет устаревший заголовок, а не добавляет другое значение, и
- не работает за пределами области корреляции:
+
+`CorrelationIdHeaderInjector` пробрасывает текущий ID в исходящий PSR-7-запрос.
+Он заменяет устаревший заголовок, а не добавляет ещё одно значение, и является
+no-op вне области корреляции:
 
 ```php
 $request = $injector->inject($request);
 $response = $httpClient->sendRequest($request);
 ```
-В комплекте конфигурации DI используется то же имя заголовка, что и в промежуточном программном обеспечении сервера. См.
- [examples/06-outgoing-request.php](examples/06-outgoing-request.php). @@ЛИНИЯ@@
-### Контекст журнала
-`CorrelationIdContextProvider` помещает `requestId` в контекст каждого сообщения
-, зарегистрированного через `Yiisoft\Log\Logger`. Регистратор использует ровно один поставщик контекста
-, поэтому создайте свой собственный `SystemContextProvider`
- регистратора — при его удалении будут потеряны `время`, `категория` и `трассировка` из каждого сообщения:
+
+Поставляемая DI-конфигурация использует тот же `headerName`, что и server-middleware.
+См. [examples/06-outgoing-request.php](examples/06-outgoing-request.php).
+
+### Контекст лога
+
+`CorrelationIdContextProvider` кладёт `requestId` в контекст каждого сообщения,
+протоколируемого через `Yiisoft\Log\Logger`. У логгера ровно один
+context-провайдер, поэтому компонуйте свой с собственным `SystemContextProvider`
+логгера — если его выкинуть, из каждого сообщения пропадут `time`, `category`
+и `trace`:
 
 ```php
 // config/common/di/logger.php
@@ -149,31 +174,36 @@ return [
     ),
 ];
 ```
-`ContextProviderInterface` принадлежит `yiisoft/log`, поэтому этот пакет никогда не связывает его с
- — создание провайдеров является вызовом приложения.
 
- Вне запроса (консольная команда, рабочая загрузка) идентификатор не установлен, поставщик контекста
- возвращает пустой массив, и ведение журнала продолжает работать. @@ЛИНИЯ@@
+`ContextProviderInterface` принадлежит `yiisoft/log`, поэтому этот пакет никогда
+его не биндит — композиция провайдеров остаётся за приложением.
+
+Вне запроса (консольная команда, bootstrap worker'а) ID не задан, context-провайдер
+возвращает пустой массив, а логирование продолжает работать.
+
 ### Конфигурация
+
 `params.php`, под ключом `rasuvaeff/yii3-correlation-id`:
 
- | Парам | По умолчанию | Значение |
- |---|---|---|
- | `имя_заголовка` | `X-Request-ID` | Прочитать из запроса, записанного в ответ |
- | `attributeName` | `идентификатор корреляции` | Атрибут запроса, содержащий идентификатор |
- | `acceptIncoming` | `правда` | Повторно используйте допустимые идентификаторы вызывающих абонентов; используйте `false` на границе публичного доверия, которая создает идентификаторы |
- | `validationPattern` | регулярное выражение UUIDv4 | Неверные входящие идентификаторы заменяются; недействительные сгенерированные идентификаторы отклоняются |
- | `maxLength` | `128` | Заменяются более длинные входящие идентификаторы; более длинные идентификаторы отклоняются |
- | `contextKey` | `requestId` | Контекстный ключ журнала |
+| Параметр | По умолчанию | Значение |
+|---|---|---|
+| `headerName` | `X-Request-ID` | Читается из запроса, пишется в ответ |
+| `attributeName` | `correlationId` | Request-атрибут, несущий ID |
+| `acceptIncoming` | `true` | Переиспользовать допустимые ID вызывающего; `false` на публичной trust-границе, где ID чеканятся самостоятельно |
+| `validationPattern` | UUIDv4-regex | Невалидные входящие ID замещаются; невалидные сгенерированные ID отвергаются |
+| `maxLength` | `128` | Более длинные входящие ID замещаются; более длинные сгенерированные ID отвергаются |
+| `contextKey` | `requestId` | Ключ в контексте лога |
 
- Для пользовательского формата идентификатора требуется генератор, соответствующий шаблон и достаточная максимальная длина
-. Сгенерированное значение вне этого контракта выдает `UnexpectedValueException`
- перед запуском обработчика запроса. См.
- [examples/04-custom-generator.php](examples/04-custom-generator.php). @@ЛИНИЯ@@
+Для кастомного формата ID нужны генератор, соответствующий паттерн и достаточная
+максимальная длина. Сгенерированное значение вне этого контракта выбрасывает
+`UnexpectedValueException` до запуска request-handler'а. См.
+[examples/04-custom-generator.php](examples/04-custom-generator.php).
+
 ### Политика входящего доверия
-После проверки формата и длины IncomingCorrelationIdPolicy может отклонить
- другой действительный идентификатор на основе контекста запроса. Отказ генерирует новый идентификатор.
- Привяжите политику в приложении DI:
+
+После валидации формата и длины `IncomingCorrelationIdPolicy` может отвергнуть
+иначе валидный ID на основании контекста запроса. Отказ генерирует свежий ID.
+Привяжите политику в DI приложения:
 
 ```php
 use Psr\Http\Message\ServerRequestInterface;
@@ -196,38 +226,45 @@ return [
     IncomingCorrelationIdPolicy::class => TrustedProxyPolicy::class,
 ];
 ```
-Для создания вручную передайте его как именованный аргумент incomingPolicy.
 
- `acceptIncoming: false` остается жестким выключателем: он пропускает политику, и
- всегда создает новый идентификатор. См.
- [examples/07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php). @@ЛИНИЯ@@
+Для ручной конструекции передайте её именованным аргументом `incomingPolicy`.
+
+`acceptIncoming: false` остаётся жёстким выключателем: он пропускает политику и
+всегда чеканит новый ID. См.
+[examples/07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php).
+
 ### Публичный API
-| Класс | Описание |
- |---|---|
- | `CorrelationIdMiddleware` | Промежуточное программное обеспечение PSR-15: разрешение, публикация, возврат |
- | `CorrelationIdProvider` | Доступ только для чтения `get`/`tryGet` для служб приложений |
- | `CorrelationIdHolder` | Держатель изменяемой инфраструктуры с однократными операциями и областями действия `runWith()` |
- | `ГенераторКорреляцииИд` | Интерфейс для генерации идентификаторов |
- | `Uuidv4Generator` | UUID Pure-PHP RFC 4122 v4 из `random_bytes()` |
- | `CorrelationIdContextProvider` | Поставщик контекста `yiisoft/log` добавляет `requestId` |
- | `CorrelationIdHeaderInjector` | Добавляет текущий идентификатор в исходящие запросы PSR-7 |
- | `IncomingCorrelationIdPolicy` | Решение о доверии с учетом запросов для действительных входящих идентификаторов |
- | `AcceptAllIncomingCorrelationIdPolicy` | Политика по умолчанию, используемая, если ничего не указано |
- | `Exception\CorrelationIdNotSetException` | Вызывается `CorrelationIdHolder::get()` вне запроса | @@ЛИНИЯ@@
-## Когда использовать это вместо yii3-телеметрии
-| | `yii3-идентификатор корреляции` | `yii3-телеметрия` |
- |---|---|---|
- | Область применения | Один сервис: коррелировать собственные журналы | Распределенная трассировка по сервисам |
- | Модель | Один идентификатор на запрос | Промежутки, родитель/потомок, выборка |
- | Распространение | Заголовок `X-Request-ID` | Контекст трассировки W3C, экспорт OTLP |
- | Стоимость | Промежуточное ПО + держатель, без экспортера | Сборщик, экспортер, конфигурация выборки |
 
- Оба могут работать вместе: сначала поместите это промежуточное программное обеспечение и прочитайте `tryGet()` в атрибуте диапазона
-. Не ожидайте, что в этом пакете будет расширена поддержка трассировки — для
- нужна телеметрия. @@ЛИНИЯ@@
+| Класс | Описание |
+|---|---|
+| `CorrelationIdMiddleware` | PSR-15-middleware: resolve, publish, echo back |
+| `CorrelationIdProvider` | Read-only доступ `get`/`tryGet` для сервисов приложения |
+| `CorrelationIdHolder` | Мутабельный infrastructure-holder с set-once-операциями и областями `runWith()` |
+| `CorrelationIdGenerator` | Интерфейс генерации ID |
+| `Uuidv4Generator` | Чистый PHP, UUID RFC 4122 v4 из `random_bytes()` |
+| `CorrelationIdContextProvider` | Context-провайдер `yiisoft/log`, добавляющий `requestId` |
+| `CorrelationIdHeaderInjector` | Добавляет текущий ID в исходящие PSR-7-запросы |
+| `IncomingCorrelationIdPolicy` | Учитывающий запрос trust-вердикт для валидных входящих ID |
+| `AcceptAllIncomingCorrelationIdPolicy` | Дефолтная политика, если никакая не задана |
+| `Exception\CorrelationIdNotSetException` | Бросается `CorrelationIdHolder::get()` вне запроса |
+
+## Когда использовать это вместо yii3-telemetry
+
+| | `yii3-correlation-id` | `yii3-telemetry` |
+|---|---|---|
+| Область | Один сервис: коррелировать собственные логи | Распределённый трейсинг между сервисами |
+| Модель | Один ID на запрос | Spans, parent/child, сэмплинг |
+| Распространение | Заголовок `X-Request-ID` | W3C Trace Context, OTLP-экспорт |
+| Стоимость | Middleware + holder, без exporter'а | Collector, exporter, конфигурация сэмплинга |
+
+Оба могут работать вместе: поставьте это middleware первым и читайте `tryGet()`
+в атрибут span. Не ждите, что пакет обрастёт поддержкой `traceparent` — для
+этого и есть телеметрия.
+
 ### Рецепты интеграции
-Держите дополнительный упаковочный клей в приложении. Для `yii3-audit-log` возьмите идентификатор
- от провайдера, а не перечитывайте недоверенный заголовок запроса:
+
+Держите опциональный package-glue в приложении. Для `yii3-audit-log` берите ID
+из провайдера, а не перечитывайте недоверенный заголовок запроса:
 
 ```php
 use Rasuvaeff\Yii3AuditLog\AuditMetadata;
@@ -238,8 +275,9 @@ $metadata = new AuditMetadata(
     userAgent: $request->getHeaderLine('User-Agent'),
 );
 ```
-Для `yii3-telemetry` добавьте его в текущий активный диапазон из кода, выполняющего
- ниже обоих промежуточных программ:
+
+Для `yii3-telemetry` добавьте его в текущий активный span из кода, исполняющегося
+ниже обоих middleware:
 
 ```php
 $id = $correlationId->tryGet();
@@ -247,45 +285,53 @@ if ($id !== null) {
     $tracer->currentSpan()->setAttribute('request.id', $id);
 }
 ```
-## Безопасность
-| Риск | Что делает пакет |
- |---|---|
- | Внедрение заголовка | Соответствующая реализация PSR-7 уже отклоняет CRLF в значении заголовка; шаблон проверки дополнительно отклоняет все, что не является правильно сформированным идентификатором, включая контент, перенесенный после пробела или табуляции |
- | Негабаритный заголовок | `maxLength` (по умолчанию 128) отклоняет длинные значения до запуска шаблона |
- | Подделанный клиентом идентификатор | Установите `acceptIncoming: false` на общедоступном шлюзе; внутренние службы принимают этот доверенный идентификатор и не должны быть напрямую доступны клиентам |
- | Внедрение журналов | И входящие, и сгенерированные идентификаторы должны пройти шаблон проверки и ограничение длины, прежде чем достигнуть держателя или контекста журнала |
- | Утечка информации | Идентификатор запроса не содержит пользовательских данных. UUIDv4 невозможно угадать, но он **не** секрет — никогда не используйте его для авторизации |
 
- **Доступ через браузер.** CORS по умолчанию не предоставляет настраиваемые заголовки ответов для JavaScript
-. Когда клиент браузера должен включить идентификатор в отчет поддержки,
- настройте промежуточное программное обеспечение CORS приложения для отправки:
+## Безопасность
+
+| Риск | Что делает пакет |
+|---|---|
+| Header injection | Конформная PSR-7-реализация уже отвергает CRLF в значении заголовка; validation-паттерн дополнительно отвергает всё, что не является well-formed ID, включая контент, спрятанный после пробела или табуляции |
+| Oversized header | `maxLength` (по умолчанию 128) отвергает длинные значения до запуска паттерна |
+| Client-spoofed ID | Поставьте `acceptIncoming: false` на публичном gateway; внутренние сервисы принимают этот доверенный ID и не должны быть напрямую достижимы клиентами |
+| Log injection | И входящие, и сгенерированные ID обязаны пройти validation-паттерн и лимит длины до того, как попасть в holder или контекст лога |
+| Info leak | Request ID не несёт пользовательских данных. UUIDv4 неугадываем, но **не** секрет — никогда не используйте его для авторизации |
+
+**Браузерный доступ.** CORS по умолчанию не экспонирует кастомные
+response-заголовки в JavaScript. Когда браузерный клиент должен включать ID в
+обращение в поддержку, настройте CORS-middleware приложения на отправку:
 
 ```http
 Access-Control-Expose-Headers: X-Request-ID
 ```
-Вместо этого используйте настроенное имя пользовательского заголовка при изменении `headerName`.
 
- **Параллелизм.** Держателем является один общий экземпляр, очищенный в блоке `finally`,
-, который подходит для последовательной обработки запросов: PHP-FPM, и рабочие процессы, которые принимают
- по одному запросу за раз (RoadRunner). При параллельном выполнении сопрограмм (Swoole), когда
- несколько запросов одновременно используют память работника, общий держатель будет передавать между ними идентификаторы
- — этот пакет не поддерживает такую ​​модель. @@ЛИНИЯ@@
+Используйте сконфигурированное кастомное имя заголовка, если `headerName`
+изменено.
+
+**Конкурентность.** Holder — один shared-инстанс, очищаемый в блоке `finally`,
+что корректно для последовательной обработки запросов: PHP-FPM и worker'ы,
+берущие по одному запросу за раз (RoadRunner). Под корутинной конкурентностью
+(Swoole), где несколько запросов одновременно делят память worker'а, общий
+holder утёк бы ID между ними — этот пакет такую модель не поддерживает.
+
 ## Примеры
-См. [examples/](examples/) для работоспособных сценариев.
- Ожидается, что примеры будут выполняться без фатальных ошибок и соответствовать документированному
- общедоступному API.
 
- | Скрипт | Шоу | Нужен сервер? |
- |---|---|---|
- | [01-middleware-setup.php](examples/01-middleware-setup.php) | Промежуточное ПО в стеке PSR-15: генерирование/повторное использование/замена | нет |
- | [02-log-context.php](examples/02-log-context.php) | `yiisoft/log` + поставщик контекста: `requestId` в каждой строке | нет |
- | [03-access-in-action.php](examples/03-access-in-action.php) | Чтение идентификатора из атрибута и из держателя | нет |
- | [04-custom-generator.php](examples/04-custom-generator.php) | ULID-подобный генератор с соответствующим шаблоном проверки | нет |
- | [05-gateway-mode.php](examples/05-gateway-mode.php) | Публичный шлюз заменяет ненадежный идентификатор, внутренняя служба сохраняет идентификатор шлюза | нет |
- | [06-outgoing-request.php](examples/06-outgoing-request.php) | Объем очереди и распространение исходящего заголовка PSR-7 | нет |
- | [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Принимайте действительный входящий идентификатор только с IP-адреса доверенного шлюза | нет | @@ЛИНИЯ@@
+См. [examples/](examples/) — исполняемые скрипты.
+Ожидается, что примеры выполняются без fatal errors и остаются
+согласованными с документированным публичным API.
+
+| Скрипт | Что показывает | Нужен сервер? |
+|---|---|---|
+| [01-middleware-setup.php](examples/01-middleware-setup.php) | Middleware в PSR-15-стеке: генерация / переиспользование / замена | нет |
+| [02-log-context.php](examples/02-log-context.php) | `yiisoft/log` + context-провайдер: `requestId` в каждой строке | нет |
+| [03-access-in-action.php](examples/03-access-in-action.php) | Чтение ID из атрибута и из holder'а | нет |
+| [04-custom-generator.php](examples/04-custom-generator.php) | ULID-подобный генератор с соответствующим validation-паттерном | нет |
+| [05-gateway-mode.php](examples/05-gateway-mode.php) | Публичный gateway заменяет недоверенный ID, внутренний сервис сохраняет ID gateway'а | нет |
+| [06-outgoing-request.php](examples/06-outgoing-request.php) | Область очереди и проброс исходящего PSR-7-заголовка | нет |
+| [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Принимать валидный входящий ID только с IP доверенного gateway'а | нет |
+
 ## Разработка
-На хосте нет PHP/Composer — запустите в Docker через образ `composer:2`:
+
+На хосте нет PHP/Composer — запускайте в Docker через образ `composer:2`:
 
 ```bash
 docker run --rm -v "$PWD":/app -w /app composer:2 composer install
@@ -294,7 +340,8 @@ docker run --rm -v "$PWD":/app -w /app composer:2 composer cs:fix
 docker run --rm -v "$PWD":/app -w /app composer:2 composer test
 docker run --rm -v "$PWD":/app -w /app composer:2 composer release-check
 ```
-Или с помощью Make:
+
+Или через Make:
 
 ```bash
 make install
@@ -305,7 +352,10 @@ make test-coverage
 make mutation
 make release-check
 ```
-`make test-coverage` и `makemutation` загружают `pcov` внутри контейнера
- `composer:2`, поскольку базовый образ не имеет драйвера покрытия. @@ЛИНИЯ@@
+
+`make test-coverage` и `make mutation` поднимают `pcov` внутри контейнера
+`composer:2`, потому что в базовом образе нет драйвера покрытия.
+
 ## Лицензия
-[BSD-3-пункт](LICENSE.md)
+
+[BSD-3-Clause](LICENSE.md)
