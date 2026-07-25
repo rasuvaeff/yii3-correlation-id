@@ -103,9 +103,13 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
 
     private function isAcceptable(string $id): bool
     {
-        // An absent header reads as an empty string; a permissive custom pattern
-        // could otherwise accept it as the correlation ID.
+        // PCRE `$` matches before a single trailing `\n`, and PSR-7 does not
+        // guarantee a header value is free of LF/CR (a permissive custom
+        // pattern could otherwise accept a smuggled `<value>\n` as the
+        // correlation ID). Reject any newline explicitly.
         return $id !== ''
+            && !str_contains($id, "\n")
+            && !str_contains($id, "\r")
             && strlen($id) <= $this->maxLength
             && preg_match($this->validationPattern, $id) === 1;
     }
