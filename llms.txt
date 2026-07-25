@@ -104,7 +104,7 @@ final readonly class UlidLikeGenerator implements CorrelationIdGenerator
 new CorrelationIdMiddleware(
     generator: new UlidLikeGenerator(),
     holder: $holder,
-    validationPattern: '/^[0-9A-HJKMNP-TV-Z]{26}$/',
+    validationPattern: '/^[0-9A-HJKMNP-TV-Z]{26}\z/',
     maxLength: 26,
 );
 ```

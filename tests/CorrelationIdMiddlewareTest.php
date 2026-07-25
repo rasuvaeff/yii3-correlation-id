@@ -74,6 +74,9 @@ final class CorrelationIdMiddlewareTest
         yield 'truncated' => ['aaaaaaaa-bbbb-4ccc-9ddd'];
         yield 'trailing garbage' => [self::INCOMING_ID . '-extra'];
         yield 'non-hex characters' => ['gggggggg-bbbb-4ccc-9ddd-eeeeeeeeeeee'];
+        // PCRE `$` matches before a trailing `\n`; a smuggled `\n` must be
+        // rejected instead of becoming the correlation ID for this request.
+        yield 'trailing newline' => [self::INCOMING_ID . "\n"];
         // CRLF never reaches the middleware — a conforming PSR-7 implementation
         // rejects such a header value outright. Smuggling within one header line
         // is what the pattern has to stop.
