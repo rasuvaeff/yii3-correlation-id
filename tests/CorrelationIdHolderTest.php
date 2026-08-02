@@ -16,6 +16,7 @@ use Testo\Test;
 
 #[Test]
 #[Covers(CorrelationIdHolder::class)]
+#[Covers(CorrelationIdNotSetException::class)]
 final class CorrelationIdHolderTest
 {
     private CorrelationIdHolder $fixture;
