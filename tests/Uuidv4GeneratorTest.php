@@ -53,7 +53,7 @@ final class Uuidv4GeneratorTest
 
     public function marksTheIdWithTheRfc4122Variant(): void
     {
-        Assert::true(in_array(explode('-', $this->fixture->generate())[3][0], ['8', '9', 'a', 'b'], true));
+        Assert::true(in_array(explode('-', $this->fixture->generate())[3][0], ['8', '9', 'a', 'b'], strict: true));
     }
 
     public function generatesLowercaseHexOnly(): void
