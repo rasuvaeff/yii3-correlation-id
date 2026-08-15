@@ -7,6 +7,7 @@ namespace Rasuvaeff\Yii3CorrelationId\Tests;
 use InvalidArgumentException;
 use Nyholm\Psr7\ServerRequest;
 use Rasuvaeff\PropertyTesting\ArbitraryInterface;
+use Rasuvaeff\PropertyTesting\Classify;
 use Rasuvaeff\PropertyTesting\Gen;
 use Rasuvaeff\PropertyTesting\Property;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdHolder;
@@ -30,6 +31,7 @@ final class CorrelationIdMiddlewareTest
 {
     private const string GENERATED_ID = '11111111-2222-4333-8444-555555555555';
     private const string INCOMING_ID = 'aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee';
+    private const string LOWERCASE_PATTERN = '/^[a-z]{1,40}$/';
 
     private CorrelationIdHolder $holder;
     private FixedGenerator $generator;
@@ -316,7 +318,7 @@ final class CorrelationIdMiddlewareTest
         yield 'over max length' => [str_repeat('a', 129)];
     }
 
-    #[Property(runs: 300)]
+    #[Property(runs: 300, timeoutMs: 1000)]
     public function responseAlwaysCarriesAnIdAcceptedByTheDefaultPattern(string $incoming): void
     {
         $holder = new CorrelationIdHolder();
@@ -327,10 +329,14 @@ final class CorrelationIdMiddlewareTest
             new FakeHandler(),
         );
 
-        Assert::same(
-            preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $response->getHeaderLine('X-Request-ID')),
-            1,
-        );
+        $id = $response->getHeaderLine('X-Request-ID');
+
+        // Both branches have to be reached or the property degenerates into
+        // "a freshly generated UUID is a UUID".
+        Classify::cover($id === $incoming, 'incoming reused', 20.0);
+        Classify::cover($id !== $incoming, 'freshly generated', 20.0);
+
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $id), 1);
     }
 
     /**
@@ -338,11 +344,121 @@ final class CorrelationIdMiddlewareTest
      */
     public static function responseAlwaysCarriesAnIdAcceptedByTheDefaultPatternGenerators(): array
     {
-        // A hex-and-dash alphabet keeps the values header-legal while covering
-        // both shapes that matter: near-miss IDs and oversized ones.
+        // Half the draws are IDs the default pattern accepts, so the reuse
+        // branch is reached at all; the rest are header-legal near misses of
+        // every length, which is where the pattern has to hold the line.
         return [
-            'incoming' => Gen::stringFrom('0123456789abcdefABCDEF-', minLength: 0, maxLength: 200),
+            'incoming' => Gen::frequency([
+                [1, Gen::uuid()],
+                [1, Gen::stringFrom('0123456789abcdefABCDEF-', minLength: 0, maxLength: 200)],
+            ]),
         ];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function responseAlwaysCarriesAnIdAcceptedByTheDefaultPatternExamples(): iterable
+    {
+        yield 'empty header value' => [''];
+        yield 'canonical incoming id' => [self::INCOMING_ID];
+        yield 'uppercase incoming id' => [strtoupper(self::INCOMING_ID)];
+        yield 'uuid v1' => ['aaaaaaaa-bbbb-1ccc-9ddd-eeeeeeeeeeee'];
+        yield 'wrong variant' => ['aaaaaaaa-bbbb-4ccc-1ddd-eeeeeeeeeeee'];
+        yield 'trailing garbage' => [self::INCOMING_ID . '-extra'];
+        yield 'over max length' => [str_repeat('a', 129)];
+    }
+
+    #[Property(runs: 300, timeoutMs: 1000)]
+    public function reusesTheIncomingIdExactlyWhenTheDefaultPatternAcceptsIt(string $incoming): void
+    {
+        $middleware = new CorrelationIdMiddleware(
+            generator: new FixedGenerator(self::GENERATED_ID),
+            holder: new CorrelationIdHolder(),
+        );
+
+        $acceptable = $incoming !== ''
+            && strlen($incoming) <= 128
+            && preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $incoming) === 1;
+
+        Classify::cover($acceptable, 'accepted', 20.0);
+        Classify::cover(!$acceptable, 'rejected', 20.0);
+
+        $response = $middleware->process(
+            (new ServerRequest('GET', '/'))->withHeader('X-Request-ID', $incoming),
+            new FakeHandler(),
+        );
+
+        Assert::same(
+            $response->getHeaderLine('X-Request-ID'),
+            $acceptable ? $incoming : self::GENERATED_ID,
+        );
+    }
+
+    /**
+     * @return array<string, ArbitraryInterface>
+     */
+    public static function reusesTheIncomingIdExactlyWhenTheDefaultPatternAcceptsItGenerators(): array
+    {
+        return [
+            'incoming' => Gen::frequency([
+                [2, Gen::uuid()],
+                [1, Gen::map(Gen::uuid(), static fn(string $id): string => strtoupper($id))],
+                [2, Gen::stringFrom('0123456789abcdef-', minLength: 0, maxLength: 40)],
+            ]),
+        ];
+    }
+
+    #[Property(runs: 200, timeoutMs: 1000)]
+    public function maxLengthRejectsAnIncomingIdTheCustomPatternWouldAccept(string $incoming, int $maxLength): void
+    {
+        $middleware = new CorrelationIdMiddleware(
+            generator: new FixedGenerator('generated'),
+            holder: new CorrelationIdHolder(),
+            validationPattern: self::LOWERCASE_PATTERN,
+            maxLength: $maxLength,
+        );
+
+        // Every generated value matches the pattern, so length is the only
+        // thing left to decide the outcome.
+        $withinLimit = strlen($incoming) <= $maxLength;
+
+        Classify::cover($withinLimit, 'within maxLength', 15.0);
+        Classify::cover(!$withinLimit, 'over maxLength', 15.0);
+
+        $response = $middleware->process(
+            (new ServerRequest('GET', '/'))->withHeader('X-Request-ID', $incoming),
+            new FakeHandler(),
+        );
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), $withinLimit ? $incoming : 'generated');
+    }
+
+    /**
+     * @return array<string, ArbitraryInterface>
+     */
+    public static function maxLengthRejectsAnIncomingIdTheCustomPatternWouldAcceptGenerators(): array
+    {
+        return [
+            // Gen::regex() takes an undelimited pattern, so the very pattern
+            // the middleware validates against is what generates the values —
+            // no second spelling of the format to drift out of sync.
+            'incoming' => Gen::regex(trim(self::LOWERCASE_PATTERN, '/')),
+            // The floor keeps the fallback ID ('generated', 9 characters)
+            // acceptable — a generator whose own ID exceeds maxLength throws
+            // instead of answering the question this property asks.
+            'maxLength' => Gen::intBetween(9, 20),
+        ];
+    }
+
+    /**
+     * @return iterable<string, array{string, int}>
+     */
+    public static function maxLengthRejectsAnIncomingIdTheCustomPatternWouldAcceptExamples(): iterable
+    {
+        yield 'exactly at the limit' => ['abcdefghij', 10];
+        yield 'one over the limit' => ['abcdefghijk', 10];
+        yield 'single character under a wide limit' => ['a', 20];
     }
 
     private function middleware(

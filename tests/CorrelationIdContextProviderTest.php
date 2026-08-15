@@ -71,7 +71,7 @@ final class CorrelationIdContextProviderTest
         );
 
         $logger->info('hello');
-        $logger->flush(true);
+        $logger->flush(final: true);
 
         Assert::same($target->messages[0]->context('requestId'), 'id-1');
     }
