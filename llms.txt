@@ -70,7 +70,8 @@ $middleware = new CorrelationIdMiddleware(
     maxLength: 128,                       // default
 );
 
-// Per request: read/generate ID -> request attribute + holder -> handler ->
+// Per request: adopt published attribute / read header / generate ID ->
+// request attribute + holder -> handler ->
 // clear holder (finally) -> X-Request-ID on the response.
 $response = $middleware->process($request, $handler);
 $id = $response->getHeaderLine('X-Request-ID');

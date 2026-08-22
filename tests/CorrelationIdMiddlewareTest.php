@@ -285,7 +285,7 @@ final class CorrelationIdMiddlewareTest
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
         Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::INCOMING_ID);
-        Assert::same($outerHandler->holderAfterInnerReturned, self::INCOMING_ID);
+        Assert::same($outerHandler->holderAfterInnerFinished, self::INCOMING_ID);
         Assert::null($this->holder->tryGet());
     }
 
@@ -307,7 +307,7 @@ final class CorrelationIdMiddlewareTest
         Assert::same($generator->calls, 1);
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
         Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
-        Assert::same($outerHandler->holderAfterInnerReturned, self::GENERATED_ID);
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
         Assert::null($this->holder->tryGet());
     }
 
@@ -331,7 +331,7 @@ final class CorrelationIdMiddlewareTest
         Assert::same($generator->calls, 1);
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
         Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
-        Assert::same($outerHandler->holderAfterInnerReturned, self::GENERATED_ID);
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
     }
 
     public function anInnerInstanceRestoresTheScopeAHandlerWroteOverOutOfBand(): void
@@ -351,7 +351,32 @@ final class CorrelationIdMiddlewareTest
 
         $this->middlewareWith($generator)->process($this->request(), $outerHandler);
 
-        Assert::same($outerHandler->holderAfterInnerReturned, self::GENERATED_ID);
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function anInnerInstanceKeepsTheScopeAliveWhileAnExceptionPropagates(): void
+    {
+        // The case the restore-instead-of-clear branch exists for: an error
+        // handler between the two layers logs the failure and needs the ID.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler(static function (): void {
+            throw new RuntimeException('downstream failure');
+        });
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        try {
+            $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+        } catch (RuntimeException) {
+            // The outer instance's `finally` has run by now; the interesting
+            // window is one frame down, recorded by NestingHandler.
+        }
+
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
         Assert::null($this->holder->tryGet());
     }
 

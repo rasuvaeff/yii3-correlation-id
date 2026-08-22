@@ -13,12 +13,13 @@ use Rasuvaeff\Yii3CorrelationId\CorrelationIdProvider;
 /**
  * Runs a second middleware instance inside the first one's handler — the
  * "registered twice" shape — and records what the holder carries once the
- * inner instance has returned but the outer one is still unwinding. That
- * window is where a reader sitting between the two layers lives.
+ * inner instance is done but the outer one is still unwinding. That window is
+ * where a reader sitting between the two layers lives: a response decorator on
+ * the way out, an error-handling middleware on the way up.
  */
 final class NestingHandler implements RequestHandlerInterface
 {
-    public ?string $holderAfterInnerReturned = null;
+    public ?string $holderAfterInnerFinished = null;
 
     public function __construct(
         private readonly MiddlewareInterface $inner,
@@ -29,9 +30,12 @@ final class NestingHandler implements RequestHandlerInterface
     #[\Override]
     public function handle(ServerRequestInterface $request): ResponseInterface
     {
-        $response = $this->inner->process($request, $this->handler);
-        $this->holderAfterInnerReturned = $this->holder->tryGet();
-
-        return $response;
+        try {
+            return $this->inner->process($request, $this->handler);
+        } finally {
+            // In `finally`, so the throwing path is observed too — that is the
+            // path an error-handling middleware above would take.
+            $this->holderAfterInnerFinished = $this->holder->tryGet();
+        }
     }
 }
