@@ -48,7 +48,8 @@ $middleware = new CorrelationIdMiddleware(
 
 1. Перенимает ID, который внешний экземпляр его же уже опубликовал в
    request-атрибуте `correlationId`, если такой есть.
-2. Иначе читает `X-Request-ID` и переиспользует значение, если оно допустимо.
+2. Иначе читает `X-Request-ID` и переиспользует значение, если оно допустимо, —
+   только при `acceptIncoming: true`, а это не значение по умолчанию.
 3. Иначе генерирует UUIDv4.
 4. Публикует ID как request-атрибут `correlationId`.
 5. Публикует ID в `CorrelationIdHolder`, замещая то, что там было.
@@ -410,13 +411,13 @@ holder утёк бы ID между ними — этот пакет такую �
 
 | Скрипт | Что показывает | Нужен сервер? |
 |---|---|---|
-| [01-middleware-setup.php](examples/01-middleware-setup.php) | Middleware в PSR-15-стеке: генерация / переиспользование / замена | нет |
+| [01-middleware-setup.php](examples/01-middleware-setup.php) | Middleware в PSR-15-стеке при `acceptIncoming: true`: генерация / переиспользование / замена | нет |
 | [02-log-context.php](examples/02-log-context.php) | `yiisoft/log` + context-провайдер: `requestId` в каждой строке | нет |
 | [03-access-in-action.php](examples/03-access-in-action.php) | Чтение ID из атрибута и из holder'а | нет |
 | [04-custom-generator.php](examples/04-custom-generator.php) | ULID-подобный генератор с соответствующим validation-паттерном | нет |
 | [05-gateway-mode.php](examples/05-gateway-mode.php) | Публичный gateway заменяет недоверенный ID, внутренний сервис сохраняет ID gateway'а | нет |
 | [06-outgoing-request.php](examples/06-outgoing-request.php) | Область очереди и проброс исходящего PSR-7-заголовка | нет |
-| [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Принимать валидный входящий ID только с IP доверенного gateway'а | нет |
+| [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Принимать валидный входящий ID только с IP доверенного gateway'а (нужен `acceptIncoming: true`) | нет |
 
 ## Разработка
 

@@ -6,9 +6,10 @@ Guidance for AI agents working on this package. Read before changing code.
 
 A request correlation ID for Yii3 applications, in namespace
 `Rasuvaeff\Yii3CorrelationId`. `CorrelationIdMiddleware` gives every request an
-ID — reusing an acceptable incoming `X-Request-ID`, generating a UUIDv4
-otherwise — publishes it as a request attribute and in `CorrelationIdHolder`,
-and echoes it back on the response. `CorrelationIdContextProvider` feeds the ID
+ID — a UUIDv4 it mints itself, or an acceptable incoming `X-Request-ID` when the
+service has explicitly opted in with `acceptIncoming: true` — publishes it as a
+request attribute and in `CorrelationIdHolder`, and echoes it back on the
+response. `CorrelationIdContextProvider` feeds the ID
 into the context of every `Yiisoft\Log\Logger` message.
 
 Public API: `CorrelationIdMiddleware`, `CorrelationIdHolder`,

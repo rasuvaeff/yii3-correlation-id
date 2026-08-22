@@ -18,7 +18,8 @@ composer require rasuvaeff/yii3-correlation-id
   writes one holder and readers read another, silently empty.
 - Application services inject read-only `CorrelationIdProvider`; mutation on
   `CorrelationIdHolder` is reserved for middleware and scope infrastructure.
-- Incoming IDs are reused only if they match `validationPattern` and are no
+- Incoming IDs are read at all only under `acceptIncoming: true` (NOT the
+  default), and then reused only if they match `validationPattern` and are no
   longer than `maxLength`; otherwise a new ID is generated. Generated IDs must
   satisfy the same contract or the middleware throws before calling the handler.
 - Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before

@@ -47,7 +47,8 @@ For each request the middleware:
 
 1. Adopts the ID an outer instance of itself already published in the
    `correlationId` request attribute, if there is one.
-2. Otherwise reads `X-Request-ID` and reuses the value if it is acceptable.
+2. Otherwise reads `X-Request-ID` and reuses the value if it is acceptable —
+   only when configured with `acceptIncoming: true`, which is not the default.
 3. Generates a UUIDv4 otherwise.
 4. Publishes the ID as the `correlationId` request attribute.
 5. Publishes the ID in `CorrelationIdHolder`, replacing whatever was there.
@@ -405,13 +406,13 @@ documented public API.
 
 | Script | Shows | Needs server? |
 |---|---|---|
-| [01-middleware-setup.php](examples/01-middleware-setup.php) | Middleware in a PSR-15 stack: generate / reuse / replace | no |
+| [01-middleware-setup.php](examples/01-middleware-setup.php) | Middleware in a PSR-15 stack under `acceptIncoming: true`: generate / reuse / replace | no |
 | [02-log-context.php](examples/02-log-context.php) | `yiisoft/log` + context provider: `requestId` on every line | no |
 | [03-access-in-action.php](examples/03-access-in-action.php) | Reading the ID from the attribute and from the holder | no |
 | [04-custom-generator.php](examples/04-custom-generator.php) | ULID-like generator with a matching validation pattern | no |
 | [05-gateway-mode.php](examples/05-gateway-mode.php) | Public gateway replaces an untrusted ID, internal service preserves the gateway ID | no |
 | [06-outgoing-request.php](examples/06-outgoing-request.php) | Queue scope and outgoing PSR-7 header propagation | no |
-| [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Accept a valid incoming ID only from a trusted gateway IP | no |
+| [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Accept a valid incoming ID only from a trusted gateway IP (needs `acceptIncoming: true`) | no |
 
 ## Development
 
