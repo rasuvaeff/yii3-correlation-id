@@ -31,8 +31,10 @@ grow them here.
    passing the control-character guard (`[\x00-\x1F\x7F]`, applied before and
    independently of the user pattern), `maxLength`, and `validationPattern`.
    Invalid incoming and attribute values are replaced; an invalid generator
-   result fails before the handler runs. `UUID_V4_PATTERN` is anchored with
-   `\z`, never `$`.
+   result fails before the handler runs. The control-character guard is what
+   makes the anchor of `validationPattern` irrelevant inside the middleware —
+   never remove it, and never "fix" the published `$` anchor of
+   `UUID_V4_PATTERN` in place (see the invariant below).
 4. **Preserve the public contract.** Update README + tests with any API change.
 
 ## Commands
@@ -113,6 +115,18 @@ make release-check
 - **Concurrency limit is real.** A shared holder is safe for sequential request
   handling (FPM, one-request-at-a-time workers) and unsafe under Swoole
   coroutines. Say so honestly in docs; do not claim blanket worker-safety.
+- **Two UUID constants, and the loose one stays.** `UUID_V4_PATTERN` is
+  `$`-anchored and therefore accepts `"<uuid>\n"` on its own; it is frozen at
+  the value 1.0.1 published, carries `@deprecated`, and remains the default
+  `$validationPattern` and the value in `config/params.php`. The strict
+  spelling lives beside it as `UUID_V4_PATTERN_STRICT` (`\z`), which is what
+  consumers should reuse. Retightening the old constant in place is a BC break
+  (roave reports both the constant value and the default parameter value) for
+  no gain: inside `process()` the control-character guard rejects a trailing
+  newline before either pattern runs, so the two constants are
+  indistinguishable there — `rejectsATrailingNewlineUnderEitherPattern` pins
+  exactly that. Anything a test compares *outside* the middleware should use
+  `UUID_V4_PATTERN_STRICT`.
 - **Control characters are rejected unconditionally.** A conforming PSR-7
   implementation rejects most of them in a header value, but not all: nyholm's
   own value check is `$`-anchored and lets a single trailing `\n` through. The

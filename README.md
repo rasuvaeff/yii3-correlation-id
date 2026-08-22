@@ -229,6 +229,21 @@ Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before
 escape, a NUL byte, or a smuggled newline reach the holder, the logs, or an
 outgoing header.
 
+### The two UUID constants
+
+`CorrelationIdMiddleware` publishes the UUIDv4 format twice:
+
+| Constant | Anchor | Use |
+|---|---|---|
+| `UUID_V4_PATTERN` | `$` | The default `validationPattern`. **Deprecated** for standalone use: PCRE `$` also matches before a single trailing `\n`, so `preg_match(UUID_V4_PATTERN, "<uuid>\n") === 1` |
+| `UUID_V4_PATTERN_STRICT` | `\z` | Reuse this one in your own code — validating a queue message's correlation id before `runWith()`, checking an ID read from a database. It rejects `"<uuid>\n"` with no separate newline check |
+
+The middleware behaves identically under either, so `validationPattern` does
+not need changing: the control-character guard above rejects a trailing newline
+before any pattern runs. The loose constant is kept, deprecated rather than
+retightened, because its literal value is published API — code pinning it or
+comparing against it would break on a silent change.
+
 ### Incoming trust policy
 
 After format and length validation, an `IncomingCorrelationIdPolicy` may reject
@@ -323,7 +338,7 @@ if ($id !== null) {
 | Header injection | Control characters (`\x00`-`\x1F`, `\x7F`) are rejected unconditionally, before `validationPattern`, so a permissive custom pattern stays safe; the pattern then rejects anything that is not a well-formed ID, including content smuggled after a space |
 | Oversized header | `maxLength` (default 128) rejects long values before the pattern runs |
 | Client-spoofed ID | Set `acceptIncoming: false` at the public gateway; internal services accept that trusted ID and must not be directly reachable by clients |
-| Log injection | Both incoming and generated IDs must pass the control-character guard, the validation pattern, and the length limit before reaching the holder or log context. `UUID_V4_PATTERN` is anchored with `\z`, not `$`, so reusing it in your own code does not accept a trailing newline |
+| Log injection | Both incoming and generated IDs must pass the control-character guard, the validation pattern, and the length limit before reaching the holder or log context. The guard runs first, so the anchor of `validationPattern` cannot weaken the middleware. Outside it, validate with `UUID_V4_PATTERN_STRICT` (`\z`), not the `$`-anchored `UUID_V4_PATTERN`, which accepts a trailing newline on its own |
 | Info leak | A request ID carries no user data. UUIDv4 is unguessable but is **not** a secret — never use it for authorization |
 
 **Browser access.** CORS does not expose custom response headers to JavaScript

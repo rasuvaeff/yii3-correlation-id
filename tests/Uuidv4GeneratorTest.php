@@ -36,7 +36,12 @@ final class Uuidv4GeneratorTest
 
     public function generatesIdMatchingTheDefaultValidationPattern(): void
     {
-        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $this->fixture->generate()), 1);
+        $id = $this->fixture->generate();
+
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $id), 1);
+        // The strict spelling too: the generator's output must satisfy the
+        // constant a consumer is told to reuse, not only the looser default.
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT, $id), 1);
     }
 
     public function generatesCanonicalHyphenatedLayout(): void

@@ -7,13 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-- **BREAKING.** `CorrelationIdMiddleware::UUID_V4_PATTERN` is now anchored with
-  `\z` instead of `$`. PCRE `$` also matches before a single trailing `\n`, so
-  the previous value accepted `"<uuid>\n"` on its own. The middleware was never
-  affected (it rejects newlines explicitly), but the constant is public API and
-  a consumer reusing it — for instance to validate a queue message's correlation
-  id before `runWith()` — inherited the trap. Code comparing the constant's
-  literal value, or relying on it accepting a trailing newline, must be updated.
+- Added `CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT`: the same UUIDv4
+  format anchored with `\z` instead of `$`. PCRE `$` also matches before a
+  single trailing `\n`, so `UUID_V4_PATTERN` accepts `"<uuid>\n"` on its own —
+  a trap for a consumer reusing the constant outside the middleware, for
+  instance to validate a queue message's correlation id before `runWith()`.
+  Use the strict constant there.
+- `UUID_V4_PATTERN` keeps its published value and stays the default
+  `validationPattern`; it is now marked `@deprecated` in favour of the strict
+  spelling. **No public contract is broken**: the constant's literal value and
+  the constructor's default parameter value are unchanged, and the middleware's
+  behaviour is unchanged under either constant, because `isAcceptable()`
+  rejects every control character before any pattern runs. The anchor only ever
+  mattered to code using the constant on its own.
 - Reject every control character (`\x00`-`\x1F`, `\x7F`) in incoming and
   generated IDs, before `validationPattern` runs and independently of it. The
   previous check covered only `\n` and `\r`, leaving a permissive custom pattern

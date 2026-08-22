@@ -23,8 +23,13 @@ composer require rasuvaeff/yii3-correlation-id
   satisfy the same contract or the middleware throws before calling the handler.
 - Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before
   `validationPattern` runs, so the guarantee holds for any custom pattern.
-- `UUID_V4_PATTERN` is anchored with `\z`, not `$` — safe to reuse for your own
-  validation without a separate newline check.
+- Two UUID constants. `UUID_V4_PATTERN` (the default `validationPattern`) is
+  anchored with `$`, which PCRE also matches before a trailing `\n`, so on its
+  own it accepts `"<uuid>\n"`; it is deprecated but frozen, because its value
+  is published API. `UUID_V4_PATTERN_STRICT` is the same format anchored with
+  `\z` — reuse that one for your own validation, no separate newline check
+  needed. Inside the middleware the choice makes no difference: the
+  control-character guard rejects the newline before either pattern runs.
 - A custom ID format needs a custom generator, matching pattern, and sufficient
   `maxLength`.
 - Use `acceptIncoming: false` at a public trust boundary that mints IDs. Trusted
@@ -80,6 +85,19 @@ $id = $response->getHeaderLine('X-Request-ID');
 Throws `InvalidArgumentException` from the constructor when `maxLength < 1` or
 `validationPattern` is not a valid regex. Throws `UnexpectedValueException`
 before calling the handler if the generator returns an unacceptable ID.
+
+Public constants:
+
+```php
+CorrelationIdMiddleware::UUID_V4_PATTERN;        // '/^…-…$/i'  deprecated, still the default
+CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT; // '/^…-…\z/i' use this in your own code
+```
+
+`preg_match(UUID_V4_PATTERN, "<uuid>\n") === 1`, because PCRE `$` matches
+before a single trailing newline; `UUID_V4_PATTERN_STRICT` returns 0. Passing
+either as `validationPattern` gives identical middleware behaviour — the
+control-character guard runs first. The loose constant is kept, deprecated
+rather than retightened, because its literal value is published API.
 
 ### CorrelationIdHolder
 

@@ -19,6 +19,7 @@ use Rasuvaeff\Yii3CorrelationId\Tests\Support\FixedGenerator;
 use Rasuvaeff\Yii3CorrelationId\Tests\Support\NestingHandler;
 use Rasuvaeff\Yii3CorrelationId\Tests\Support\SequenceGenerator;
 use Rasuvaeff\Yii3CorrelationId\Uuidv4Generator;
+use ReflectionClass;
 use RuntimeException;
 use Stringable;
 use Testo\Assert;
@@ -449,14 +450,102 @@ final class CorrelationIdMiddlewareTest
         }];
     }
 
-    public function theDefaultPatternRejectsATrailingNewlineOnItsOwn(): void
+    public function theLegacyPatternAcceptsATrailingNewlineOnItsOwn(): void
     {
-        // The constant is public API. A consumer validating a queue message's
-        // correlation id with it has none of the middleware's own guards, so
-        // the anchor has to be `\z` rather than `$` (which matches before a
-        // single trailing `\n`).
-        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, self::INCOMING_ID . "\n"), 0);
+        // This is why the constant carries `@deprecated`, and the reason the
+        // strict spelling was added beside it rather than replacing it: `$`
+        // matches before a single trailing `\n`, so a consumer validating a
+        // queue message's correlation id with this constant — outside the
+        // middleware, without its guards — accepts `"<uuid>\n"`.
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, self::INCOMING_ID . "\n"), 1);
         Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, self::INCOMING_ID), 1);
+    }
+
+    public function theStrictPatternRejectsATrailingNewlineOnItsOwn(): void
+    {
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT, self::INCOMING_ID . "\n"), 0);
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT, self::INCOMING_ID), 1);
+    }
+
+    /**
+     * The load-bearing one: the two constants disagree about `"<uuid>\n"`, and
+     * the middleware does not care. `isAcceptable()` runs the
+     * control-character guard before any pattern, so keeping the published
+     * `$`-anchored default is not a weakening of the middleware — only of a
+     * consumer that reuses the constant on its own.
+     */
+    #[DataProvider('bothUuidPatternsProvider')]
+    public function rejectsATrailingNewlineUnderEitherPattern(string $validationPattern): void
+    {
+        $handler = new FakeHandler();
+        // nyholm's own header-value check is `$`-anchored, so a single
+        // trailing `\n` really does reach the middleware.
+        $request = $this->request(self::INCOMING_ID . "\n");
+
+        $response = $this->middleware(validationPattern: $validationPattern)->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->generator->calls, 1);
+    }
+
+    /**
+     * The same, from the request attribute an outer instance of the middleware
+     * would have published: that path validates too, and it validates the same
+     * way under either constant.
+     */
+    #[DataProvider('bothUuidPatternsProvider')]
+    public function refusesToAdoptAnAttributeWithATrailingNewlineUnderEitherPattern(string $validationPattern): void
+    {
+        $handler = new FakeHandler();
+        $request = $this->request()->withAttribute('correlationId', self::INCOMING_ID . "\n");
+
+        $response = $this->middleware(validationPattern: $validationPattern)->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->generator->calls, 1);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function bothUuidPatternsProvider(): iterable
+    {
+        yield 'legacy $-anchored default' => [CorrelationIdMiddleware::UUID_V4_PATTERN];
+        yield 'strict \z-anchored' => [CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT];
+    }
+
+    public function theTwoPatternsDifferOnlyInTheirAnchor(): void
+    {
+        Assert::same(
+            str_replace('$/i', '\z/i', CorrelationIdMiddleware::UUID_V4_PATTERN),
+            CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT,
+        );
+    }
+
+    /**
+     * The default is spelled through a private constant so the package's own
+     * default does not trip the deprecation on `UUID_V4_PATTERN`. That is an
+     * implementation detail with one hard obligation: the two must stay equal,
+     * or the published default parameter value would silently drift away from
+     * the published constant.
+     */
+    public function theLegacyConstantIsStillTheDefaultValidationPattern(): void
+    {
+        $parameters = (new ReflectionClass(CorrelationIdMiddleware::class))
+            ->getConstructor()
+            ?->getParameters() ?? [];
+
+        $defaults = [];
+
+        foreach ($parameters as $parameter) {
+            if ($parameter->getName() === 'validationPattern') {
+                $defaults[] = $parameter->getDefaultValue();
+            }
+        }
+
+        Assert::same($defaults, [CorrelationIdMiddleware::UUID_V4_PATTERN]);
     }
 
     #[DataProvider('controlCharacterProvider')]
@@ -640,7 +729,10 @@ final class CorrelationIdMiddlewareTest
         Classify::cover($id === $incoming, 'incoming reused', 20.0);
         Classify::cover($id !== $incoming, 'freshly generated', 20.0);
 
-        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $id), 1);
+        // Asserted against the strict constant on purpose: the middleware runs
+        // on the `$`-anchored default, and what leaves it still has to survive
+        // the tighter anchor.
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT, $id), 1);
     }
 
     /**
@@ -683,9 +775,13 @@ final class CorrelationIdMiddlewareTest
             holder: new CorrelationIdHolder(),
         );
 
+        // The middleware runs on the `$`-anchored default, but the oracle is
+        // spelled with the strict constant — and that is the point: the
+        // control-character guard makes the two indistinguishable from inside
+        // `process()`. A `"<uuid>\n"` header is rejected either way.
         $acceptable = $incoming !== ''
             && strlen($incoming) <= 128
-            && preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $incoming) === 1;
+            && preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT, $incoming) === 1;
 
         Classify::cover($acceptable, 'accepted', 20.0);
         Classify::cover(!$acceptable, 'rejected', 20.0);
@@ -784,12 +880,15 @@ final class CorrelationIdMiddlewareTest
     }
 
     /**
-     * The `\z` anchor of the public constant, checked from a consumer's
+     * The `\z` anchor of `UUID_V4_PATTERN_STRICT`, checked from a consumer's
      * position: nothing here goes through the middleware, so none of its
-     * compensating guards can hide a `$`-anchored spelling.
+     * compensating guards can hide a slack anchor. The `$`-anchored
+     * `UUID_V4_PATTERN` deliberately fails this property — that is precisely
+     * why it is deprecated for standalone use, and why the strict spelling
+     * exists.
      */
     #[Property(runs: 400, timeoutMs: 1000)]
-    public function theDefaultPatternAcceptsExactlyCanonicalUuidV4Strings(string $candidate): void
+    public function theStrictPatternAcceptsExactlyCanonicalUuidV4Strings(string $candidate): void
     {
         $structural = $this->looksLikeUuidV4($candidate);
 
@@ -797,13 +896,13 @@ final class CorrelationIdMiddlewareTest
         Classify::cover(!$structural, 'not a uuid v4', 20.0);
         Classify::when(str_contains($candidate, "\n"), 'contains a line feed');
 
-        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $candidate) === 1, $structural);
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT, $candidate) === 1, $structural);
     }
 
     /**
      * @return array<string, ArbitraryInterface>
      */
-    public static function theDefaultPatternAcceptsExactlyCanonicalUuidV4StringsGenerators(): array
+    public static function theStrictPatternAcceptsExactlyCanonicalUuidV4StringsGenerators(): array
     {
         return [
             'candidate' => Gen::frequency([
@@ -822,7 +921,7 @@ final class CorrelationIdMiddlewareTest
     /**
      * @return iterable<string, array{string}>
      */
-    public static function theDefaultPatternAcceptsExactlyCanonicalUuidV4StringsExamples(): iterable
+    public static function theStrictPatternAcceptsExactlyCanonicalUuidV4StringsExamples(): iterable
     {
         yield 'canonical' => [self::INCOMING_ID];
         yield 'uppercase' => [strtoupper(self::INCOMING_ID)];
