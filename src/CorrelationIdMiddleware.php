@@ -23,7 +23,15 @@ use UnexpectedValueException;
  */
 final readonly class CorrelationIdMiddleware implements MiddlewareInterface
 {
-    public const string UUID_V4_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i';
+    /**
+     * Anchored with `\z`, not `$`: PCRE `$` also matches before a single
+     * trailing `\n`, so a `$`-anchored spelling accepts `"<uuid>\n"`. The
+     * constant is public API — a consumer validating their own IDs with it
+     * gets the strict meaning without having to know that trap.
+     */
+    public const string UUID_V4_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i';
+
+    private const string CONTROL_CHARACTER_PATTERN = '/[\x00-\x1F\x7F]/';
 
     /**
      * @param string $headerName Read from the request and written to the response.
@@ -66,7 +74,14 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
         $id = $this->resolveId($request);
-        $this->holder->set($id);
+        // `override()`, not `set()`: the middleware owns the request scope
+        // rather than asserting it is the first writer. A stray ID left in the
+        // holder (worker bootstrap that forgot to clear, a handler that called
+        // `exit()`, the middleware registered twice) is dropped on the next
+        // request instead of making `set()` throw on every request this worker
+        // ever handles again. `set()` keeps its set-once contract for
+        // application and queue code.
+        $this->holder->override($id);
 
         try {
             $response = $handler->handle($request->withAttribute($this->attributeName, $id));
@@ -103,13 +118,16 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
 
     private function isAcceptable(string $id): bool
     {
-        // PCRE `$` matches before a single trailing `\n`, and PSR-7 does not
-        // guarantee a header value is free of LF/CR (a permissive custom
-        // pattern could otherwise accept a smuggled `<value>\n` as the
-        // correlation ID). Reject any newline explicitly.
+        // Control characters are rejected before the user pattern runs, so the
+        // guarantee holds whatever `validationPattern` is. It stops CR/LF
+        // smuggled inside one legal header line (PSR-7 does not guarantee a
+        // value is free of them, and PCRE `$` matches before a trailing `\n`),
+        // ANSI/OSC escapes that would be replayed by a terminal reading the
+        // logs, and NUL/TAB that corrupt log lines and downstream parsers.
+        // It also rejects the `", "` join of several `X-Request-ID` headers
+        // whenever one of them carries a control byte.
         return $id !== ''
-            && !str_contains($id, "\n")
-            && !str_contains($id, "\r")
+            && preg_match(self::CONTROL_CHARACTER_PATTERN, $id) === 0
             && strlen($id) <= $this->maxLength
             && preg_match($this->validationPattern, $id) === 1;
     }

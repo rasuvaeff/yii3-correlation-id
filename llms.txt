@@ -21,12 +21,20 @@ composer require rasuvaeff/yii3-correlation-id
 - Incoming IDs are reused only if they match `validationPattern` and are no
   longer than `maxLength`; otherwise a new ID is generated. Generated IDs must
   satisfy the same contract or the middleware throws before calling the handler.
+- Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before
+  `validationPattern` runs, so the guarantee holds for any custom pattern.
+- `UUID_V4_PATTERN` is anchored with `\z`, not `$` — safe to reuse for your own
+  validation without a separate newline check.
 - A custom ID format needs a custom generator, matching pattern, and sufficient
   `maxLength`.
 - Use `acceptIncoming: false` at a public trust boundary that mints IDs. Trusted
   internal services normally keep it true to preserve the gateway ID.
-- The middleware clears the holder in `finally`. Correct for FPM and
+- The middleware owns the request scope: it calls `override()` (not `set()`) and
+  clears the holder in `finally`, so a stray ID is dropped rather than turning
+  every later request of that worker into an error. Correct for FPM and
   one-request-at-a-time workers; not for Swoole coroutines.
+- `CorrelationIdHolder::set()` stays set-once (throws `LogicException`) for
+  application and queue code; `override()` is unconditional.
 - `Yiisoft\Log\ContextProvider\ContextProviderInterface` is never bound by this
   package — the application composes providers.
 - `CorrelationIdHeaderInjector` replaces the configured header on outgoing

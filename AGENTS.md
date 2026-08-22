@@ -27,9 +27,11 @@ grow them here.
    `composer build`. "Should work" does not count.
 2. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
 3. **Every ID satisfies one validation contract.** Incoming and generated IDs
-   reach the holder, response header, and logs only after passing `maxLength`
-   and `validationPattern`. Invalid incoming values are replaced; an invalid
-   generator result fails before the handler runs.
+   reach the holder, response header, and logs only after passing the
+   control-character guard (`[\x00-\x1F\x7F]`, applied before and independently
+   of the user pattern), `maxLength`, and `validationPattern`. Invalid incoming
+   values are replaced; an invalid generator result fails before the handler
+   runs. `UUID_V4_PATTERN` is anchored with `\z`, never `$`.
 4. **Preserve the public contract.** Update README + tests with any API change.
 
 ## Commands
@@ -78,10 +80,13 @@ make release-check
   `yiisoft/log`, takes exactly one implementation, and the application composes
   its providers (`CompositeContextProvider`). Binding a foreign vendor's key
   from here is what triggers `yiisoft/config` duplicate-key errors.
-- **The holder is set-once, cleared in `finally`.** That is what keeps a
-  long-lived worker from leaking an ID into the next request. Keep the `finally`
-  and keep `override()` as a low-level escape hatch; queue/CLI consumers should
-  use `runWith()` so cleanup cannot be forgotten.
+- **The middleware owns the request scope; the holder is set-once for everyone
+  else.** `process()` calls `override()` and clears in `finally`, so a stray ID
+  (worker bootstrap, `exit()` in a handler, the middleware registered twice)
+  costs one request instead of poisoning the worker forever. Do not turn that
+  back into `set()` — `set()`'s `LogicException` was a permanent 500 loop.
+  Keep the `finally`; queue/CLI consumers should use `runWith()` so cleanup
+  cannot be forgotten.
 - **Generator, validation pattern, and maximum length are one contract.** A
   custom format needs all three to agree. Invalid generated output must fail
   before the handler runs, so business side effects cannot precede a response
@@ -92,9 +97,12 @@ make release-check
 - **Concurrency limit is real.** A shared holder is safe for sequential request
   handling (FPM, one-request-at-a-time workers) and unsafe under Swoole
   coroutines. Say so honestly in docs; do not claim blanket worker-safety.
-- **CRLF never reaches the middleware.** A conforming PSR-7 implementation
-  rejects such header values first, so the pattern's job is stopping content
-  smuggled within one legal header line.
+- **Control characters are rejected unconditionally.** A conforming PSR-7
+  implementation rejects most of them in a header value, but not all: nyholm's
+  own value check is `$`-anchored and lets a single trailing `\n` through. The
+  guard runs before `validationPattern` precisely so a permissive custom pattern
+  (`/^.{1,64}\z/s`, the "opaque token" shape the docs invite) cannot leak an
+  ANSI escape or a NUL byte into the logs and outgoing headers.
 - Code: `declare(strict_types=1)`, `final readonly class`, `#[\Override]`,
   explicit types.
 - `examples/` is part of the public contract: keep scripts runnable and update

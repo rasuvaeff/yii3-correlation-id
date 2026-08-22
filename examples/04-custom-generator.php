@@ -34,10 +34,15 @@ final readonly class UlidLikeGenerator implements CorrelationIdGenerator
 // The generator and the validation pattern must agree: the pattern decides
 // which incoming IDs are reusable, and it has to accept what the generator
 // emits. Leave them out of sync and every request regenerates.
+//
+// Anchor with `\z`, not `$`: PCRE `$` also matches before a single trailing
+// `\n`. Even if you forget, control characters (\x00-\x1F, \x7F) are rejected
+// by the middleware before your pattern runs, so a deliberately permissive
+// pattern still cannot leak an escape sequence into your logs.
 $middleware = new CorrelationIdMiddleware(
     generator: new UlidLikeGenerator(),
     holder: new CorrelationIdHolder(),
-    validationPattern: '/^[0-9A-HJKMNP-TV-Z]{26}$/',
+    validationPattern: '/^[0-9A-HJKMNP-TV-Z]{26}\z/',
     maxLength: 26,
 );
 

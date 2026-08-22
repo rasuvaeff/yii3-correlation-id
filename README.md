@@ -48,7 +48,7 @@ For each request the middleware:
 1. Reads `X-Request-ID` and reuses the value if it is acceptable.
 2. Generates a UUIDv4 otherwise.
 3. Publishes the ID as the `correlationId` request attribute.
-4. Publishes the ID in `CorrelationIdHolder`.
+4. Publishes the ID in `CorrelationIdHolder`, replacing whatever was there.
 5. Clears the holder in a `finally` block.
 6. Sets `X-Request-ID` on the response.
 
@@ -115,6 +115,13 @@ $id = $correlationId->tryGet();  // null outside a correlation scope
 writes it and everything else reads it. The `yiisoft/di` container does this by
 autowiring. The package aliases `CorrelationIdProvider` to that same instance;
 application services should not depend on the holder's mutation methods.
+
+The middleware **owns** the request scope: it overwrites whatever the holder
+held and clears it in `finally`. A stray ID — left by worker bootstrap, by a
+handler that called `exit()`, or by the middleware being registered twice — is
+dropped on the next request instead of failing every request that worker will
+ever handle again. `set()` keeps its set-once contract for application and queue
+code, where a second write really is a mistake.
 
 ### Queue and console scopes
 
@@ -196,6 +203,11 @@ length. A generated value outside that contract throws `UnexpectedValueException
 before the request handler runs. See
 [examples/04-custom-generator.php](examples/04-custom-generator.php).
 
+Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before
+`validationPattern` runs, so a permissive custom pattern cannot let an ANSI
+escape, a NUL byte, or a smuggled newline reach the holder, the logs, or an
+outgoing header.
+
 ### Incoming trust policy
 
 After format and length validation, an `IncomingCorrelationIdPolicy` may reject
@@ -236,7 +248,7 @@ always mints a new ID. See
 |---|---|
 | `CorrelationIdMiddleware` | PSR-15 middleware: resolve, publish, echo back |
 | `CorrelationIdProvider` | Read-only `get`/`tryGet` access for application services |
-| `CorrelationIdHolder` | Mutable infrastructure holder with set-once operations and `runWith()` scopes |
+| `CorrelationIdHolder` | Mutable infrastructure holder: set-once `set()`, unconditional `override()`, and `runWith()` scopes |
 | `CorrelationIdGenerator` | Interface for ID generation |
 | `Uuidv4Generator` | Pure-PHP RFC 4122 v4 UUIDs from `random_bytes()` |
 | `CorrelationIdContextProvider` | `yiisoft/log` context provider adding `requestId` |
@@ -287,10 +299,10 @@ if ($id !== null) {
 
 | Risk | What the package does |
 |---|---|
-| Header injection | A conforming PSR-7 implementation already rejects CRLF in a header value; the validation pattern additionally rejects anything that is not a well-formed ID, including content smuggled after a space or a tab |
+| Header injection | Control characters (`\x00`-`\x1F`, `\x7F`) are rejected unconditionally, before `validationPattern`, so a permissive custom pattern stays safe; the pattern then rejects anything that is not a well-formed ID, including content smuggled after a space |
 | Oversized header | `maxLength` (default 128) rejects long values before the pattern runs |
 | Client-spoofed ID | Set `acceptIncoming: false` at the public gateway; internal services accept that trusted ID and must not be directly reachable by clients |
-| Log injection | Both incoming and generated IDs must pass the validation pattern and length limit before reaching the holder or log context |
+| Log injection | Both incoming and generated IDs must pass the control-character guard, the validation pattern, and the length limit before reaching the holder or log context. `UUID_V4_PATTERN` is anchored with `\z`, not `$`, so reusing it in your own code does not accept a trailing newline |
 | Info leak | A request ID carries no user data. UUIDv4 is unguessable but is **not** a secret — never use it for authorization |
 
 **Browser access.** CORS does not expose custom response headers to JavaScript

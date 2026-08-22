@@ -6,6 +6,9 @@ namespace Rasuvaeff\Yii3CorrelationId\Tests;
 
 use InvalidArgumentException;
 use Nyholm\Psr7\ServerRequest;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\RequestHandlerInterface;
 use Rasuvaeff\PropertyTesting\ArbitraryInterface;
 use Rasuvaeff\PropertyTesting\Classify;
 use Rasuvaeff\PropertyTesting\Gen;
@@ -32,6 +35,10 @@ final class CorrelationIdMiddlewareTest
     private const string GENERATED_ID = '11111111-2222-4333-8444-555555555555';
     private const string INCOMING_ID = 'aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee';
     private const string LOWERCASE_PATTERN = '/^[a-z]{1,40}$/';
+    // The "ULID, opaque token" pattern the docblock of CorrelationIdGenerator
+    // invites users to write. `/s` makes `.` match newlines too, so nothing but
+    // the middleware's own guard stands between a control byte and the logs.
+    private const string PERMISSIVE_PATTERN = '/^.{1,64}\z/s';
 
     private CorrelationIdHolder $holder;
     private FixedGenerator $generator;
@@ -224,6 +231,150 @@ final class CorrelationIdMiddlewareTest
         Assert::same($second->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
     }
 
+    public function recoversFromAStrayIdLeftInTheHolder(): void
+    {
+        // Worker bootstrap (or a handler that called exit()) left an ID behind.
+        // Before the fix `set()` threw here, and kept throwing for every
+        // request this worker would ever handle again.
+        $this->holder->set('left behind by worker bootstrap');
+
+        $response = $this->middleware()->process($this->request(self::INCOMING_ID), new FakeHandler());
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function aStrayIdNeverReachesTheHandler(): void
+    {
+        $this->holder->set('left behind by worker bootstrap');
+        $seen = null;
+        $handler = new FakeHandler(function () use (&$seen): void {
+            $seen = $this->holder->tryGet();
+        });
+
+        $this->middleware()->process($this->request(self::INCOMING_ID), $handler);
+
+        Assert::same($seen, self::INCOMING_ID);
+    }
+
+    public function keepsServingRequestsAfterAHandlerPoisonsTheHolder(): void
+    {
+        $middleware = $this->middleware();
+        $poisoning = new FakeHandler(function (): void {
+            // Stands in for code that re-enters the holder and never restores
+            // it — the `finally` clear cannot help once the scope is corrupted.
+            $this->holder->override('poisoned');
+        });
+
+        $middleware->process($this->request(self::INCOMING_ID), $poisoning);
+        $second = $middleware->process($this->request(), new FakeHandler());
+
+        Assert::same($second->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function toleratesBeingRegisteredTwice(): void
+    {
+        $innerHandler = new FakeHandler();
+        $outerHandler = new readonly class ($this->middleware(), $innerHandler) implements RequestHandlerInterface {
+            public function __construct(
+                private CorrelationIdMiddleware $inner,
+                private FakeHandler $handler,
+            ) {}
+
+            #[\Override]
+            public function handle(ServerRequestInterface $request): ResponseInterface
+            {
+                return $this->inner->process($request, $this->handler);
+            }
+        };
+
+        $response = $this->middleware()->process($this->request(self::INCOMING_ID), $outerHandler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
+        Assert::same($innerHandler->handledRequest?->getAttribute('correlationId'), self::INCOMING_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function theDefaultPatternRejectsATrailingNewlineOnItsOwn(): void
+    {
+        // The constant is public API. A consumer validating a queue message's
+        // correlation id with it has none of the middleware's own guards, so
+        // the anchor has to be `\z` rather than `$` (which matches before a
+        // single trailing `\n`).
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, self::INCOMING_ID . "\n"), 0);
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, self::INCOMING_ID), 1);
+    }
+
+    #[DataProvider('controlCharacterProvider')]
+    public function rejectsAGeneratedIdCarryingAControlCharacterUnderAPermissivePattern(string $generated): void
+    {
+        $this->generator = new FixedGenerator($generated);
+        $handler = new FakeHandler();
+
+        Expect::exception(UnexpectedValueException::class)
+            ->withMessageContaining('does not satisfy validationPattern and maxLength');
+
+        try {
+            $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)->process($this->request(), $handler);
+        } finally {
+            Assert::null($handler->handledRequest);
+        }
+    }
+
+    public static function controlCharacterProvider(): iterable
+    {
+        yield 'nul byte' => ["opaque\x00token"];
+        yield 'ansi osc escape' => ["opaque\x1B]0;pwned\x07token"];
+        yield 'tab' => ["opaque\ttoken"];
+        yield 'delete' => ["opaque\x7Ftoken"];
+        yield 'carriage return' => ["opaque\rtoken"];
+        yield 'line feed' => ["opaque\ntoken"];
+        yield 'backspace' => ["opaque\x08token"];
+        yield 'unit separator, top of the control range' => ["opaque\x1Ftoken"];
+        yield 'start of heading, bottom of the control range' => ["\x01opaque"];
+        yield 'trailing escape' => ["opaque\x1B"];
+    }
+
+    #[DataProvider('controlFreeIdProvider')]
+    public function acceptsAControlFreeIdUnderAPermissivePattern(string $generated): void
+    {
+        $this->generator = new FixedGenerator($generated);
+
+        $response = $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)
+            ->process($this->request(), new FakeHandler());
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), $generated);
+    }
+
+    public static function controlFreeIdProvider(): iterable
+    {
+        yield 'opaque token' => ['01ARZ3NDEKTSV4RRFFQ69G5FAV'];
+        yield 'space, one above the control range' => ['opaque token'];
+        yield 'tilde, one below delete' => ['opaque~token'];
+        yield 'high byte, one above delete' => ["opaque\x80token"];
+    }
+
+    #[DataProvider('incomingControlCharacterProvider')]
+    public function rejectsAnIncomingIdCarryingAControlCharacterUnderAPermissivePattern(string $incoming): void
+    {
+        $this->generator = new FixedGenerator('generated-id');
+
+        $response = $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)
+            ->process($this->request($incoming), new FakeHandler());
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), 'generated-id');
+    }
+
+    public static function incomingControlCharacterProvider(): iterable
+    {
+        // Only header values a conforming PSR-7 implementation lets through:
+        // nyholm accepts TAB, and its own `$`-anchored value check accepts a
+        // single trailing LF — exactly the smuggling this guard has to stop.
+        yield 'tab' => ["opaque\ttoken"];
+        yield 'trailing line feed' => ["opaque-token\n"];
+    }
+
     public function overwritesAnIdHeaderSetDownstream(): void
     {
         $handler = new FakeHandler();
@@ -367,6 +518,8 @@ final class CorrelationIdMiddlewareTest
         yield 'wrong variant' => ['aaaaaaaa-bbbb-4ccc-1ddd-eeeeeeeeeeee'];
         yield 'trailing garbage' => [self::INCOMING_ID . '-extra'];
         yield 'over max length' => [str_repeat('a', 129)];
+        yield 'trailing line feed' => [self::INCOMING_ID . "\n"];
+        yield 'tab-smuggled content' => [self::INCOMING_ID . "\tX-Evil: 1"];
     }
 
     #[Property(runs: 300, timeoutMs: 1000)]
@@ -407,6 +560,22 @@ final class CorrelationIdMiddlewareTest
                 [2, Gen::stringFrom('0123456789abcdef-', minLength: 0, maxLength: 40)],
             ]),
         ];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function reusesTheIncomingIdExactlyWhenTheDefaultPatternAcceptsItExamples(): iterable
+    {
+        yield 'canonical incoming id' => [self::INCOMING_ID];
+        yield 'uppercase incoming id' => [strtoupper(self::INCOMING_ID)];
+        // nyholm's own header-value check is `$`-anchored, so this reaches the
+        // middleware; both the pattern's `\z` and the control-character guard
+        // have to turn it down.
+        yield 'trailing line feed' => [self::INCOMING_ID . "\n"];
+        yield 'tab-smuggled content' => [self::INCOMING_ID . "\tX-Evil: 1"];
+        yield 'space-smuggled content' => [self::INCOMING_ID . ' X-Evil: 1'];
+        yield 'empty header value' => [''];
     }
 
     #[Property(runs: 200, timeoutMs: 1000)]
@@ -459,6 +628,90 @@ final class CorrelationIdMiddlewareTest
         yield 'exactly at the limit' => ['abcdefghij', 10];
         yield 'one over the limit' => ['abcdefghijk', 10];
         yield 'single character under a wide limit' => ['a', 20];
+    }
+
+    /**
+     * The `\z` anchor of the public constant, checked from a consumer's
+     * position: nothing here goes through the middleware, so none of its
+     * compensating guards can hide a `$`-anchored spelling.
+     */
+    #[Property(runs: 400, timeoutMs: 1000)]
+    public function theDefaultPatternAcceptsExactlyCanonicalUuidV4Strings(string $candidate): void
+    {
+        $structural = $this->looksLikeUuidV4($candidate);
+
+        Classify::cover($structural, 'canonical uuid v4', 20.0);
+        Classify::cover(!$structural, 'not a uuid v4', 20.0);
+        Classify::when(str_contains($candidate, "\n"), 'contains a line feed');
+
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $candidate) === 1, $structural);
+    }
+
+    /**
+     * @return array<string, ArbitraryInterface>
+     */
+    public static function theDefaultPatternAcceptsExactlyCanonicalUuidV4StringsGenerators(): array
+    {
+        return [
+            'candidate' => Gen::frequency([
+                [3, Gen::uuid()],
+                [1, Gen::map(Gen::uuid(), static fn(string $id): string => strtoupper($id))],
+                // The trap itself: a canonical UUID plus one trailing newline.
+                [2, Gen::map(Gen::uuid(), static fn(string $id): string => $id . "\n")],
+                // Header-legal and header-illegal near misses drawn from an
+                // alphabet that mixes hex, the separator and control bytes — no
+                // Assume, both verdicts arise naturally.
+                [3, Gen::stringFrom("0123456789abcdefABCDEF-\n\r\t\x00\x1B", minLength: 0, maxLength: 40)],
+            ]),
+        ];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function theDefaultPatternAcceptsExactlyCanonicalUuidV4StringsExamples(): iterable
+    {
+        yield 'canonical' => [self::INCOMING_ID];
+        yield 'uppercase' => [strtoupper(self::INCOMING_ID)];
+        yield 'trailing line feed' => [self::INCOMING_ID . "\n"];
+        yield 'trailing carriage return' => [self::INCOMING_ID . "\r"];
+        yield 'leading line feed' => ["\n" . self::INCOMING_ID];
+        yield 'two trailing line feeds' => [self::INCOMING_ID . "\n\n"];
+        yield 'trailing nul byte' => [self::INCOMING_ID . "\x00"];
+        yield 'trailing ansi escape' => [self::INCOMING_ID . "\x1B[31m"];
+        yield 'empty' => [''];
+        yield 'uuid v1' => ['aaaaaaaa-bbbb-1ccc-9ddd-eeeeeeeeeeee'];
+        yield 'wrong variant' => ['aaaaaaaa-bbbb-4ccc-1ddd-eeeeeeeeeeee'];
+        yield 'nul byte inside the last group' => ["aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeee\x00e"];
+    }
+
+    /**
+     * A second, deliberately different spelling of "canonical UUID v4": no
+     * regex, so it cannot share a bug with the constant under test.
+     */
+    private function looksLikeUuidV4(string $value): bool
+    {
+        if (strlen($value) !== 36) {
+            return false;
+        }
+
+        $lower = strtolower($value);
+
+        if ($lower[8] !== '-' || $lower[13] !== '-' || $lower[18] !== '-' || $lower[23] !== '-') {
+            return false;
+        }
+
+        if ($lower[14] !== '4' || !in_array($lower[19], ['8', '9', 'a', 'b'], strict: true)) {
+            return false;
+        }
+
+        foreach ([[0, 8], [9, 4], [15, 3], [20, 3], [24, 12]] as [$offset, $length]) {
+            if (!ctype_xdigit(substr($lower, $offset, $length))) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private function middleware(

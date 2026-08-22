@@ -49,7 +49,7 @@ $middleware = new CorrelationIdMiddleware(
 1. Читает `X-Request-ID` и переиспользит значение, если оно допустимо.
 2. Иначе генерирует UUIDv4.
 3. Публикует ID как request-атрибут `correlationId`.
-4. Публикует ID в `CorrelationIdHolder`.
+4. Публикует ID в `CorrelationIdHolder`, замещая то, что там было.
 5. Очищает holder в блоке `finally`.
 6. Устанавливает `X-Request-ID` в ответе.
 
@@ -116,6 +116,13 @@ $id = $correlationId->tryGet();  // null outside a correlation scope
 пишет в него, всё остальное читает. Контейнер `yiisoft/di` делает это через
 autowiring. Пакет алиасит `CorrelationIdProvider` на тот же инстанс; сервисы
 приложения не должны зависеть от мутабельных методов holder'а.
+
+Middleware **владеет** областью запроса: он перезаписывает то, что лежало в
+holder'е, и очищает его в `finally`. Осевший ID — оставленный bootstrap'ом
+воркера, обработчиком, вызвавшим `exit()`, или двойной регистрацией middleware —
+сбрасывается на следующем запросе, а не превращает каждый запрос этого воркера в
+ошибку навсегда. `set()` сохраняет свой set-once-контракт для прикладного и
+очередного кода, где вторая запись действительно является ошибкой.
 
 ### Области очереди и консоли
 
@@ -199,6 +206,11 @@ return [
 `UnexpectedValueException` до запуска request-handler'а. См.
 [examples/04-custom-generator.php](examples/04-custom-generator.php).
 
+Управляющие символы (`\x00`-`\x1F`, `\x7F`) отвергаются до применения
+`validationPattern`, поэтому разрешительный пользовательский паттерн не пропустит
+ANSI-escape, NUL-байт или спрятанный перевод строки в holder, логи или исходящий
+заголовок.
+
 ### Политика входящего доверия
 
 После валидации формата и длины `IncomingCorrelationIdPolicy` может отвергнуть
@@ -239,7 +251,7 @@ return [
 |---|---|
 | `CorrelationIdMiddleware` | PSR-15-middleware: resolve, publish, echo back |
 | `CorrelationIdProvider` | Read-only доступ `get`/`tryGet` для сервисов приложения |
-| `CorrelationIdHolder` | Мутабельный infrastructure-holder с set-once-операциями и областями `runWith()` |
+| `CorrelationIdHolder` | Мутабельный infrastructure-holder: set-once `set()`, безусловный `override()` и области `runWith()` |
 | `CorrelationIdGenerator` | Интерфейс генерации ID |
 | `Uuidv4Generator` | Чистый PHP, UUID RFC 4122 v4 из `random_bytes()` |
 | `CorrelationIdContextProvider` | Context-провайдер `yiisoft/log`, добавляющий `requestId` |
@@ -290,10 +302,10 @@ if ($id !== null) {
 
 | Риск | Что делает пакет |
 |---|---|
-| Header injection | Конформная PSR-7-реализация уже отвергает CRLF в значении заголовка; validation-паттерн дополнительно отвергает всё, что не является well-formed ID, включая контент, спрятанный после пробела или табуляции |
+| Header injection | Управляющие символы (`\x00`-`\x1F`, `\x7F`) отвергаются безусловно, до `validationPattern`, поэтому разрешительный пользовательский паттерн остаётся безопасным; далее паттерн отвергает всё, что не является well-formed ID, включая контент, спрятанный после пробела |
 | Oversized header | `maxLength` (по умолчанию 128) отвергает длинные значения до запуска паттерна |
 | Client-spoofed ID | Поставьте `acceptIncoming: false` на публичном gateway; внутренние сервисы принимают этот доверенный ID и не должны быть напрямую достижимы клиентами |
-| Log injection | И входящие, и сгенерированные ID обязаны пройти validation-паттерн и лимит длины до того, как попасть в holder или контекст лога |
+| Log injection | И входящие, и сгенерированные ID обязаны пройти проверку на управляющие символы, validation-паттерн и лимит длины до того, как попасть в holder или контекст лога. `UUID_V4_PATTERN` заякорен `\z`, а не `$`, поэтому переиспользование его в своём коде не примет завершающий перевод строки |
 | Info leak | Request ID не несёт пользовательских данных. UUIDv4 неугадываем, но **не** секрет — никогда не используйте его для авторизации |
 
 **Браузерный доступ.** CORS по умолчанию не экспонирует кастомные
