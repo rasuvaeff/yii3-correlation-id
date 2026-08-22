@@ -26,12 +26,13 @@ grow them here.
 1. **Verification is mandatory.** Never claim "done" without a fresh green
    `composer build`. "Should work" does not count.
 2. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
-3. **Every ID satisfies one validation contract.** Incoming and generated IDs
-   reach the holder, response header, and logs only after passing the
-   control-character guard (`[\x00-\x1F\x7F]`, applied before and independently
-   of the user pattern), `maxLength`, and `validationPattern`. Invalid incoming
-   values are replaced; an invalid generator result fails before the handler
-   runs. `UUID_V4_PATTERN` is anchored with `\z`, never `$`.
+3. **Every ID satisfies one validation contract.** Incoming, generated, and
+   attribute-adopted IDs reach the holder, response header, and logs only after
+   passing the control-character guard (`[\x00-\x1F\x7F]`, applied before and
+   independently of the user pattern), `maxLength`, and `validationPattern`.
+   Invalid incoming and attribute values are replaced; an invalid generator
+   result fails before the handler runs. `UUID_V4_PATTERN` is anchored with
+   `\z`, never `$`.
 4. **Preserve the public contract.** Update README + tests with any API change.
 
 ## Commands
@@ -75,18 +76,33 @@ make release-check
 - **Outgoing propagation replaces, never appends.** A stale request ID must not
   survive beside the current one. Outside a scope, injection is a no-op.
 - **Policies run after validation.** Never pass malformed or oversized IDs to
-  `IncomingCorrelationIdPolicy`. `acceptIncoming: false` is a hard bypass.
+  `IncomingCorrelationIdPolicy`. `acceptIncoming: false` is a hard bypass of the
+  incoming *header* — it is not a bypass of the request attribute, which an
+  outer instance of this same middleware may have already filled with an ID it
+  minted itself.
+- **A nested instance adopts, it does not decide.** `process()` first looks at
+  the request attribute; a value there that passes the full validation contract
+  is the ID, ahead of `acceptIncoming`, the header, and the generator. Ordering
+  is load-bearing twice over: it stops one request from carrying two IDs (logs
+  vs response header), and it stops an inner `acceptIncoming: true` instance
+  from reading back the caller header an outer `acceptIncoming: false` instance
+  deliberately ignored — the outer one does not strip that header.
 - **`ContextProviderInterface` is not ours to bind.** It belongs to
   `yiisoft/log`, takes exactly one implementation, and the application composes
   its providers (`CompositeContextProvider`). Binding a foreign vendor's key
   from here is what triggers `yiisoft/config` duplicate-key errors.
-- **The middleware owns the request scope; the holder is set-once for everyone
-  else.** `process()` calls `override()` and clears in `finally`, so a stray ID
-  (worker bootstrap, `exit()` in a handler, the middleware registered twice)
-  costs one request instead of poisoning the worker forever. Do not turn that
-  back into `set()` — `set()`'s `LogicException` was a permanent 500 loop.
-  Keep the `finally`; queue/CLI consumers should use `runWith()` so cleanup
-  cannot be forgotten.
+- **The outermost instance owns the request scope; the holder is set-once for
+  everyone else.** `process()` calls `override()` and clears in `finally`, so a
+  stray ID (worker bootstrap, `exit()` in a handler) costs one request instead
+  of poisoning the worker forever. Do not turn that back into `set()` —
+  `set()`'s `LogicException` was a permanent 500 loop. A *nested* instance
+  restores the adopted ID in `finally` instead of clearing: clearing would blank
+  the holder for readers between the two layers while the outer instance is
+  still unwinding. Do not collapse the two branches into a generic
+  "restore whatever was there before" — that would restore a stray ID and undo
+  the self-healing. The discriminator is "did this instance adopt the
+  attribute", nothing else. Queue/CLI consumers should use `runWith()` so
+  cleanup cannot be forgotten.
 - **Generator, validation pattern, and maximum length are one contract.** A
   custom format needs all three to agree. Invalid generated output must fail
   before the handler runs, so business side effects cannot precede a response

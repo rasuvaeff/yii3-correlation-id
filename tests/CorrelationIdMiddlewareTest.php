@@ -6,20 +6,21 @@ namespace Rasuvaeff\Yii3CorrelationId\Tests;
 
 use InvalidArgumentException;
 use Nyholm\Psr7\ServerRequest;
-use Psr\Http\Message\ResponseInterface;
-use Psr\Http\Message\ServerRequestInterface;
-use Psr\Http\Server\RequestHandlerInterface;
 use Rasuvaeff\PropertyTesting\ArbitraryInterface;
 use Rasuvaeff\PropertyTesting\Classify;
 use Rasuvaeff\PropertyTesting\Gen;
 use Rasuvaeff\PropertyTesting\Property;
+use Rasuvaeff\Yii3CorrelationId\CorrelationIdGenerator;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdHolder;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdMiddleware;
 use Rasuvaeff\Yii3CorrelationId\IncomingCorrelationIdPolicy;
 use Rasuvaeff\Yii3CorrelationId\Tests\Support\FakeHandler;
 use Rasuvaeff\Yii3CorrelationId\Tests\Support\FixedGenerator;
+use Rasuvaeff\Yii3CorrelationId\Tests\Support\NestingHandler;
+use Rasuvaeff\Yii3CorrelationId\Tests\Support\SequenceGenerator;
 use Rasuvaeff\Yii3CorrelationId\Uuidv4Generator;
 use RuntimeException;
+use Stringable;
 use Testo\Assert;
 use Testo\Codecov\Covers;
 use Testo\Data\DataProvider;
@@ -33,6 +34,7 @@ use UnexpectedValueException;
 final class CorrelationIdMiddlewareTest
 {
     private const string GENERATED_ID = '11111111-2222-4333-8444-555555555555';
+    private const string SECOND_GENERATED_ID = '66666666-7777-4888-9999-aaaaaaaaaaaa';
     private const string INCOMING_ID = 'aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee';
     private const string LOWERCASE_PATTERN = '/^[a-z]{1,40}$/';
     // The "ULID, opaque token" pattern the docblock of CorrelationIdGenerator
@@ -276,25 +278,150 @@ final class CorrelationIdMiddlewareTest
 
     public function toleratesBeingRegisteredTwice(): void
     {
-        $innerHandler = new FakeHandler();
-        $outerHandler = new readonly class ($this->middleware(), $innerHandler) implements RequestHandlerInterface {
-            public function __construct(
-                private CorrelationIdMiddleware $inner,
-                private FakeHandler $handler,
-            ) {}
-
-            #[\Override]
-            public function handle(ServerRequestInterface $request): ResponseInterface
-            {
-                return $this->inner->process($request, $this->handler);
-            }
-        };
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler($this->middleware(), $leaf, $this->holder);
 
         $response = $this->middleware()->process($this->request(self::INCOMING_ID), $outerHandler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
-        Assert::same($innerHandler->handledRequest?->getAttribute('correlationId'), self::INCOMING_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::INCOMING_ID);
+        Assert::same($outerHandler->holderAfterInnerReturned, self::INCOMING_ID);
         Assert::null($this->holder->tryGet());
+    }
+
+    public function nestedRegistrationsAgreeOnOneIdWhenTheHeaderIsAbsent(): void
+    {
+        // Without the attribute being adopted, the inner instance mints its own
+        // ID: the handler and the logs carry it while the outer instance still
+        // writes its own to the response header. One request, two IDs.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $response = $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+
+        Assert::same($generator->calls, 1);
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($outerHandler->holderAfterInnerReturned, self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function nestingDoesNotLetAnInnerInstanceUndoATrustBoundary(): void
+    {
+        // The outer instance mints its own ID precisely so the caller's cannot
+        // be trusted — but the caller's header is still on the request, and an
+        // inner instance with the default `acceptIncoming: true` would happily
+        // read it back and hand it to the handler and the logs.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $response = $this->middlewareWith($generator, acceptIncoming: false)
+            ->process($this->request(self::INCOMING_ID), $outerHandler);
+
+        Assert::same($generator->calls, 1);
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($outerHandler->holderAfterInnerReturned, self::GENERATED_ID);
+    }
+
+    public function anInnerInstanceRestoresTheScopeAHandlerWroteOverOutOfBand(): void
+    {
+        // The inner instance does not own the scope, so it must not clear it on
+        // the way out — the outer instance is still unwinding, and anything
+        // decorating the response between the two layers reads the holder.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler(function (): void {
+            $this->holder->override('written by the handler out of band');
+        });
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+
+        Assert::same($outerHandler->holderAfterInnerReturned, self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function theOutermostInstanceStillSelfHealsUnderNesting(): void
+    {
+        // Self-healing and nesting-awareness have to coexist: the stray ID is
+        // still dropped, because only an instance that found the attribute
+        // treats itself as nested.
+        $this->holder->set('left behind by worker bootstrap');
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $response = $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function anAlreadyPublishedAttributeWinsOverTheIncomingHeader(): void
+    {
+        $handler = new FakeHandler();
+        $request = $this->request(self::INCOMING_ID)
+            ->withAttribute('correlationId', self::SECOND_GENERATED_ID);
+
+        $response = $this->middleware()->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::SECOND_GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::SECOND_GENERATED_ID);
+        Assert::same($this->generator->calls, 0);
+    }
+
+    #[DataProvider('unadoptableAttributeProvider')]
+    public function ignoresARequestAttributeThatIsNotAnAcceptableId(mixed $attribute): void
+    {
+        // Only this middleware is supposed to write that attribute, but nothing
+        // enforces it — a route parameter or an unrelated middleware sharing
+        // the name must not get to decide the correlation ID.
+        $handler = new FakeHandler();
+        $request = $this->request()->withAttribute('correlationId', $attribute);
+
+        $response = $this->middleware()->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->generator->calls, 1);
+    }
+
+    public static function unadoptableAttributeProvider(): iterable
+    {
+        yield 'not a uuid' => ['not-a-uuid'];
+        yield 'empty string' => [''];
+        yield 'over max length' => [str_repeat('a', 129)];
+        yield 'control character' => [self::INCOMING_ID . "\n"];
+        yield 'not a string at all' => [42];
+        yield 'array' => [[self::INCOMING_ID]];
+        // A Stringable is not a string: adopting it would mean the ID reaching
+        // the holder had never been through the validation contract.
+        yield 'stringable object' => [new class implements Stringable {
+            #[\Override]
+            public function __toString(): string
+            {
+                return 'aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee';
+            }
+        }];
     }
 
     public function theDefaultPatternRejectsATrailingNewlineOnItsOwn(): void
@@ -732,6 +859,21 @@ final class CorrelationIdMiddlewareTest
             validationPattern: $validationPattern,
             maxLength: $maxLength,
             incomingPolicy: $incomingPolicy,
+        );
+    }
+
+    /**
+     * The nesting tests need two instances drawing from one generator that
+     * answers differently every call — `$this->generator` is fixed by design.
+     */
+    private function middlewareWith(
+        CorrelationIdGenerator $generator,
+        bool $acceptIncoming = true,
+    ): CorrelationIdMiddleware {
+        return new CorrelationIdMiddleware(
+            generator: $generator,
+            holder: $this->holder,
+            acceptIncoming: $acceptIncoming,
         );
     }
 

@@ -33,6 +33,13 @@ composer require rasuvaeff/yii3-correlation-id
   clears the holder in `finally`, so a stray ID is dropped rather than turning
   every later request of that worker into an error. Correct for FPM and
   one-request-at-a-time workers; not for Swoole coroutines.
+- Registered twice, a nested instance adopts the ID the outer one published in
+  the request attribute — it does not re-read the header, does not mint a second
+  ID, and does not clear the holder (the outer instance owns the cleanup). That
+  is also what stops an inner `acceptIncoming: true` instance from reading back
+  the caller header an outer `acceptIncoming: false` instance just rejected. The
+  attribute passes the same validation contract as an incoming header before it
+  is adopted.
 - `CorrelationIdHolder::set()` stays set-once (throws `LogicException`) for
   application and queue code; `override()` is unconditional.
 - `Yiisoft\Log\ContextProvider\ContextProviderInterface` is never bound by this

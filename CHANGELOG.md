@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   long-running worker — an unbounded run of 500s until the process restarted.
   It now costs at most the request that discovers it. `set()` keeps its set-once
   contract for application and queue code.
+- A second instance of the middleware further down the stack now adopts the ID
+  the outer one published in the request attribute instead of resolving its own.
+  Two consequences. With no acceptable incoming header, the inner instance used
+  to generate a second ID: the handler and the log context carried it while the
+  outer instance wrote its own to the response header, so one request appeared
+  under two IDs. And an inner instance with the default `acceptIncoming: true`
+  used to read the caller's header straight back after an outer instance with
+  `acceptIncoming: false` had deliberately ignored it — the client-supplied ID
+  reached the handler and the logs of a service that had minted its own
+  precisely to avoid that. The attribute is adopted only after passing the same
+  control-character, `maxLength` and `validationPattern` checks as an incoming
+  header. A nested instance also restores the adopted ID in `finally` rather
+  than clearing the holder, which the outer instance still owns; the outermost
+  instance clears as before, so the self-healing above is unaffected.
 
 ## 1.0.1 — 2026-07-25
 

@@ -19,6 +19,11 @@ use UnexpectedValueException;
  * Place it first in the stack — everything downstream that logs should already
  * see the ID.
  *
+ * A second instance further down the stack (the middleware registered twice,
+ * a module that adds its own copy) adopts the ID the outer one already
+ * published in the request attribute instead of minting a rival, so the logs,
+ * the handler and the response header never disagree.
+ *
  * @api
  */
 final readonly class CorrelationIdMiddleware implements MiddlewareInterface
@@ -73,7 +78,10 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
     #[\Override]
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
-        $id = $this->resolveId($request);
+        // Non-null exactly when an outer instance of this middleware already
+        // owns the scope; the ID is then adopted rather than re-decided.
+        $published = $this->publishedId($request);
+        $id = $published ?? $this->resolveId($request);
         // `override()`, not `set()`: the middleware owns the request scope
         // rather than asserting it is the first writer. A stray ID left in the
         // holder (worker bootstrap that forgot to clear, a handler that called
@@ -86,10 +94,35 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
         try {
             $response = $handler->handle($request->withAttribute($this->attributeName, $id));
         } finally {
-            $this->holder->clear();
+            if ($published === null) {
+                $this->holder->clear();
+            } else {
+                // Nested instance: the scope belongs to the outer one, which
+                // clears it itself. Clearing here would blank the holder for
+                // every reader sitting between the two layers; restoring the
+                // adopted ID also undoes a handler that wrote the holder
+                // out of band. Only the outermost instance self-heals.
+                $this->holder->override($published);
+            }
         }
 
         return $response->withHeader($this->headerName, $id);
+    }
+
+    /**
+     * The request attribute is populated server-side only — never from the
+     * wire — but it still passes the full validation contract before being
+     * adopted, so unrelated code writing that attribute cannot decide the
+     * correlation ID.
+     */
+    private function publishedId(ServerRequestInterface $request): ?string
+    {
+        return $this->adoptable($request->getAttribute($this->attributeName));
+    }
+
+    private function adoptable(mixed $published): ?string
+    {
+        return is_string($published) && $this->isAcceptable($published) ? $published : null;
     }
 
     private function resolveId(ServerRequestInterface $request): string

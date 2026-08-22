@@ -45,12 +45,15 @@ $middleware = new CorrelationIdMiddleware(
 
 For each request the middleware:
 
-1. Reads `X-Request-ID` and reuses the value if it is acceptable.
-2. Generates a UUIDv4 otherwise.
-3. Publishes the ID as the `correlationId` request attribute.
-4. Publishes the ID in `CorrelationIdHolder`, replacing whatever was there.
-5. Clears the holder in a `finally` block.
-6. Sets `X-Request-ID` on the response.
+1. Adopts the ID an outer instance of itself already published in the
+   `correlationId` request attribute, if there is one.
+2. Otherwise reads `X-Request-ID` and reuses the value if it is acceptable.
+3. Generates a UUIDv4 otherwise.
+4. Publishes the ID as the `correlationId` request attribute.
+5. Publishes the ID in `CorrelationIdHolder`, replacing whatever was there.
+6. Clears the holder in a `finally` block — unless it adopted the ID at step 1,
+   in which case the outer instance owns the cleanup.
+7. Sets `X-Request-ID` on the response.
 
 Under `yiisoft/config` the bundled `config/di.php` wires all of this from
 `params.php`, so the middleware only needs adding to your middleware stack.
@@ -117,11 +120,29 @@ autowiring. The package aliases `CorrelationIdProvider` to that same instance;
 application services should not depend on the holder's mutation methods.
 
 The middleware **owns** the request scope: it overwrites whatever the holder
-held and clears it in `finally`. A stray ID — left by worker bootstrap, by a
-handler that called `exit()`, or by the middleware being registered twice — is
-dropped on the next request instead of failing every request that worker will
-ever handle again. `set()` keeps its set-once contract for application and queue
-code, where a second write really is a mistake.
+held and clears it in `finally`. A stray ID — left by worker bootstrap or by a
+handler that called `exit()` — is dropped on the next request instead of failing
+every request that worker will ever handle again. `set()` keeps its set-once
+contract for application and queue code, where a second write really is a
+mistake.
+
+### Registered twice
+
+A second instance further down the stack — the middleware added twice, a module
+that ships its own copy — **adopts** the ID the outer one already published in
+the request attribute. It does not read the incoming header again, does not mint
+a rival ID, and does not clear the holder on the way out, since the scope
+belongs to the outer instance. Without that, one request would carry two IDs:
+the inner one in the logs and the handler, the outer one in the response header.
+
+It also keeps `acceptIncoming: false` meaningful: the caller's header is still on
+the request after the outer instance decided to ignore it, and an inner instance
+with the default `acceptIncoming: true` would otherwise read it right back.
+
+The attribute is adopted only after passing the same control-character,
+`maxLength` and `validationPattern` checks as an incoming header, so unrelated
+code writing that attribute (a route parameter of the same name) cannot decide
+the correlation ID.
 
 ### Queue and console scopes
 
@@ -192,7 +213,7 @@ provider returns an empty array, and logging keeps working.
 | Param | Default | Meaning |
 |---|---|---|
 | `headerName` | `X-Request-ID` | Read from the request, written to the response |
-| `attributeName` | `correlationId` | Request attribute carrying the ID |
+| `attributeName` | `correlationId` | Request attribute carrying the ID; also how a nested instance recognises the outer one's scope |
 | `acceptIncoming` | `true` | Reuse acceptable caller IDs; use `false` at a public trust boundary that mints IDs |
 | `validationPattern` | UUIDv4 regex | Invalid incoming IDs are replaced; invalid generated IDs are rejected |
 | `maxLength` | `128` | Longer incoming IDs are replaced; longer generated IDs are rejected |
