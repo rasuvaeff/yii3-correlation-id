@@ -18,15 +18,43 @@ composer require rasuvaeff/yii3-correlation-id
   writes one holder and readers read another, silently empty.
 - Application services inject read-only `CorrelationIdProvider`; mutation on
   `CorrelationIdHolder` is reserved for middleware and scope infrastructure.
-- Incoming IDs are reused only if they match `validationPattern` and are no
+- Incoming IDs are read at all only under `acceptIncoming: true` (NOT the
+  default), and then reused only if they match `validationPattern` and are no
   longer than `maxLength`; otherwise a new ID is generated. Generated IDs must
   satisfy the same contract or the middleware throws before calling the handler.
+- Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before
+  `validationPattern` runs, so the guarantee holds for any custom pattern.
+- One UUID constant. `UUID_V4_PATTERN` (the default `validationPattern`) is
+  anchored with `\z` and is safe to reuse for your own validation — no separate
+  newline check needed. Up to 1.0.1 it was `$`-anchored, which PCRE also matches
+  before a trailing `\n`, so the old value accepted `"<uuid>\n"` on its own.
+  Inside the middleware the anchor never mattered: the control-character guard
+  rejects the newline before any pattern runs.
 - A custom ID format needs a custom generator, matching pattern, and sufficient
   `maxLength`.
-- Use `acceptIncoming: false` at a public trust boundary that mints IDs. Trusted
-  internal services normally keep it true to preserve the gateway ID.
-- The middleware clears the holder in `finally`. Correct for FPM and
+- `acceptIncoming` defaults to `false`: the caller's ID is ignored and one is
+  minted here. Set it to `true` only on an internal service that direct client
+  traffic cannot reach, to preserve the gateway ID across hops. The default was
+  `true` up to 1.0.1.
+- The middleware owns the request scope: it calls `override()` (not `set()`) and
+  clears the holder in `finally`, so a stray ID is dropped rather than turning
+  every later request of that worker into an error. Correct for FPM and
   one-request-at-a-time workers; not for Swoole coroutines.
+- Registered twice, a nested instance adopts the ID the outer one published in
+  the request attribute — it does not re-read the header, does not mint a second
+  ID, and does not clear the holder (the outer instance owns the cleanup). That
+  is also what stops an inner `acceptIncoming: true` instance from reading back
+  the caller header an outer `acceptIncoming: false` instance just rejected. The
+  attribute passes the same validation contract as an incoming header before it
+  is adopted.
+- `CorrelationIdHolder::set()` stays set-once (throws `LogicException`) for
+  application and queue code; `override()` is unconditional.
+- Every holder write validates: `set()`, `override()` and `runWith()` throw
+  `InvalidArgumentException` for an empty ID, an ID over 4096 bytes, or an ID
+  carrying a control character. Validation runs before the holder's state is
+  touched, so a rejected call changes nothing and `runWith()` never invokes the
+  callback. The ceiling is a log-bloat guard, far above the middleware's
+  `maxLength` default of 128 — it never rejects what the middleware accepted.
 - `Yiisoft\Log\ContextProvider\ContextProviderInterface` is never bound by this
   package — the application composes providers.
 - `CorrelationIdHeaderInjector` replaces the configured header on outgoing
@@ -50,12 +78,13 @@ $middleware = new CorrelationIdMiddleware(
     holder: $holder,
     headerName: 'X-Request-ID',           // default
     attributeName: 'correlationId',       // default
-    acceptIncoming: true,                 // false = mint here, e.g. public gateway
+    acceptIncoming: false,                // default; true = trust the caller's ID
     validationPattern: CorrelationIdMiddleware::UUID_V4_PATTERN, // default
     maxLength: 128,                       // default
 );
 
-// Per request: read/generate ID -> request attribute + holder -> handler ->
+// Per request: adopt published attribute / read header / generate ID ->
+// request attribute + holder -> handler ->
 // clear holder (finally) -> X-Request-ID on the response.
 $response = $middleware->process($request, $handler);
 $id = $response->getHeaderLine('X-Request-ID');
@@ -64,6 +93,18 @@ $id = $response->getHeaderLine('X-Request-ID');
 Throws `InvalidArgumentException` from the constructor when `maxLength < 1` or
 `validationPattern` is not a valid regex. Throws `UnexpectedValueException`
 before calling the handler if the generator returns an unacceptable ID.
+
+Public constants:
+
+```php
+CorrelationIdMiddleware::UUID_V4_PATTERN; // '/^…-…\z/i' the default; safe to reuse
+```
+
+`preg_match(UUID_V4_PATTERN, "<uuid>\n") === 0`. Up to 1.0.1 the constant was
+`$`-anchored and returned 1 there, because PCRE `$` matches before a single
+trailing newline. Middleware behaviour is identical under either anchor — the
+control-character guard runs first — so the change only affects code using the
+constant on its own.
 
 ### CorrelationIdHolder
 
@@ -75,6 +116,12 @@ $holder->tryGet();        // ?string
 $holder->clear();         // reopens set() for the next request
 $holder->runWith('id', fn () => $work()); // restores previous scope in finally
 ```
+
+`set()`, `override()` and `runWith()` throw `InvalidArgumentException` when the
+ID is empty, longer than 4096 bytes, or carries a control character
+(`\x00`-`\x1F`, `\x7F`) — the argument is checked before the holder's state is
+touched. Validate a queue message's ID against `UUID_V4_PATTERN` (or your own
+pattern) before opening a scope with it.
 
 Inject `CorrelationIdProvider` into application services when only `get()` and
 `tryGet()` are required.
@@ -170,7 +217,7 @@ CORS: `Access-Control-Expose-Headers: X-Request-ID`.
 'rasuvaeff/yii3-correlation-id' => [
     'headerName' => 'X-Request-ID',
     'attributeName' => 'correlationId',
-    'acceptIncoming' => true,
+    'acceptIncoming' => false,
     'validationPattern' => CorrelationIdMiddleware::UUID_V4_PATTERN,
     'maxLength' => 128,
     'contextKey' => 'requestId',

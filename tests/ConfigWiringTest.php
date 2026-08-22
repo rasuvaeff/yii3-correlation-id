@@ -71,7 +71,7 @@ final class ConfigWiringTest
 
         Assert::same($this->property($middleware, 'headerName'), 'X-Request-ID');
         Assert::same($this->property($middleware, 'attributeName'), 'correlationId');
-        Assert::true($this->property($middleware, 'acceptIncoming'));
+        Assert::false($this->property($middleware, 'acceptIncoming'));
         Assert::same($this->property($middleware, 'validationPattern'), CorrelationIdMiddleware::UUID_V4_PATTERN);
         Assert::same($this->property($middleware, 'maxLength'), 128);
         Assert::instanceOf($this->property($middleware, 'incomingPolicy'), AcceptAllIncomingCorrelationIdPolicy::class);
@@ -98,14 +98,16 @@ final class ConfigWiringTest
         $params = array_replace_recursive($this->params(), [
             'rasuvaeff/yii3-correlation-id' => [
                 'headerName' => 'X-Correlation-ID',
-                'acceptIncoming' => false,
+                // Opposite of the package default, so the assertion below fails
+                // if the override stops reaching the container.
+                'acceptIncoming' => true,
                 'contextKey' => 'correlation_id',
             ],
         ]);
         $container = new Container(ContainerConfig::create()->withDefinitions($this->di($params)));
 
         Assert::same($this->property($container->get(CorrelationIdMiddleware::class), 'headerName'), 'X-Correlation-ID');
-        Assert::false($this->property($container->get(CorrelationIdMiddleware::class), 'acceptIncoming'));
+        Assert::true($this->property($container->get(CorrelationIdMiddleware::class), 'acceptIncoming'));
         Assert::same($this->property($container->get(CorrelationIdContextProvider::class), 'contextKey'), 'correlation_id');
         Assert::same($this->property($container->get(CorrelationIdHeaderInjector::class), 'headerName'), 'X-Correlation-ID');
     }

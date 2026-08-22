@@ -10,13 +10,18 @@ use Rasuvaeff\PropertyTesting\ArbitraryInterface;
 use Rasuvaeff\PropertyTesting\Classify;
 use Rasuvaeff\PropertyTesting\Gen;
 use Rasuvaeff\PropertyTesting\Property;
+use Rasuvaeff\Yii3CorrelationId\CorrelationIdGenerator;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdHolder;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdMiddleware;
 use Rasuvaeff\Yii3CorrelationId\IncomingCorrelationIdPolicy;
 use Rasuvaeff\Yii3CorrelationId\Tests\Support\FakeHandler;
 use Rasuvaeff\Yii3CorrelationId\Tests\Support\FixedGenerator;
+use Rasuvaeff\Yii3CorrelationId\Tests\Support\NestingHandler;
+use Rasuvaeff\Yii3CorrelationId\Tests\Support\SequenceGenerator;
 use Rasuvaeff\Yii3CorrelationId\Uuidv4Generator;
+use ReflectionClass;
 use RuntimeException;
+use Stringable;
 use Testo\Assert;
 use Testo\Codecov\Covers;
 use Testo\Data\DataProvider;
@@ -30,8 +35,13 @@ use UnexpectedValueException;
 final class CorrelationIdMiddlewareTest
 {
     private const string GENERATED_ID = '11111111-2222-4333-8444-555555555555';
+    private const string SECOND_GENERATED_ID = '66666666-7777-4888-9999-aaaaaaaaaaaa';
     private const string INCOMING_ID = 'aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee';
     private const string LOWERCASE_PATTERN = '/^[a-z]{1,40}$/';
+    // The "ULID, opaque token" pattern the docblock of CorrelationIdGenerator
+    // invites users to write. `/s` makes `.` match newlines too, so nothing but
+    // the middleware's own guard stands between a control byte and the logs.
+    private const string PERMISSIVE_PATTERN = '/^.{1,64}\z/s';
 
     private CorrelationIdHolder $holder;
     private FixedGenerator $generator;
@@ -104,6 +114,46 @@ final class CorrelationIdMiddlewareTest
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
         Assert::same($this->generator->calls, 1);
+    }
+
+    /**
+     * The safe default, constructed with no `acceptIncoming` argument at all
+     * so the constructor's own default is what decides. A middleware that has
+     * not been told it sits behind a trusted gateway must not let the caller
+     * pick the ID its logs are keyed by.
+     */
+    public function ignoresTheIncomingIdByDefault(): void
+    {
+        $middleware = new CorrelationIdMiddleware(generator: $this->generator, holder: $this->holder);
+        $handler = new FakeHandler();
+
+        $response = $middleware->process($this->request(self::INCOMING_ID), $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->generator->calls, 1);
+    }
+
+    /**
+     * The holder's own length ceiling sits far above any `maxLength` the
+     * middleware would plausibly be configured with, so a documented custom
+     * format (long opaque tokens under a permissive pattern) never has the
+     * holder reject what the middleware just accepted.
+     */
+    public function aLongIdTheMiddlewareAcceptsReachesTheHolder(): void
+    {
+        $long = str_repeat('a', 512);
+        $this->generator = new FixedGenerator($long);
+        $seen = null;
+        $handler = new FakeHandler(function () use (&$seen): void {
+            $seen = $this->holder->tryGet();
+        });
+
+        $response = $this->middleware(validationPattern: '/^a{1,1024}\z/', maxLength: 1024)
+            ->process($this->request(), $handler);
+
+        Assert::same($seen, $long);
+        Assert::same($response->getHeaderLine('X-Request-ID'), $long);
     }
 
     public function policyMayRejectAValidIncomingId(): void
@@ -224,6 +274,376 @@ final class CorrelationIdMiddlewareTest
         Assert::same($second->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
     }
 
+    public function recoversFromAStrayIdLeftInTheHolder(): void
+    {
+        // Worker bootstrap (or a handler that called exit()) left an ID behind.
+        // Before the fix `set()` threw here, and kept throwing for every
+        // request this worker would ever handle again.
+        $this->holder->set('left behind by worker bootstrap');
+
+        $response = $this->middleware()->process($this->request(self::INCOMING_ID), new FakeHandler());
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function aStrayIdNeverReachesTheHandler(): void
+    {
+        $this->holder->set('left behind by worker bootstrap');
+        $seen = null;
+        $handler = new FakeHandler(function () use (&$seen): void {
+            $seen = $this->holder->tryGet();
+        });
+
+        $this->middleware()->process($this->request(self::INCOMING_ID), $handler);
+
+        Assert::same($seen, self::INCOMING_ID);
+    }
+
+    public function keepsServingRequestsAfterOutOfBandCodePoisonsTheHolder(): void
+    {
+        $middleware = $this->middleware();
+
+        $middleware->process($this->request(self::INCOMING_ID), new FakeHandler());
+
+        // Between two requests of the same worker: a scheduled task, a bootstrap
+        // hook, anything that writes the holder outside the middleware's own
+        // `finally`. The next request has to survive it.
+        $this->holder->override('poisoned by out-of-band code');
+
+        $second = $middleware->process($this->request(), new FakeHandler());
+
+        Assert::same($second->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function toleratesBeingRegisteredTwice(): void
+    {
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler($this->middleware(), $leaf, $this->holder);
+
+        $response = $this->middleware()->process($this->request(self::INCOMING_ID), $outerHandler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::INCOMING_ID);
+        Assert::same($outerHandler->holderAfterInnerFinished, self::INCOMING_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function nestedRegistrationsAgreeOnOneIdWhenTheHeaderIsAbsent(): void
+    {
+        // Without the attribute being adopted, the inner instance mints its own
+        // ID: the handler and the logs carry it while the outer instance still
+        // writes its own to the response header. One request, two IDs.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $response = $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+
+        Assert::same($generator->calls, 1);
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function nestingDoesNotLetAnInnerInstanceUndoATrustBoundary(): void
+    {
+        // The outer instance mints its own ID precisely so the caller's cannot
+        // be trusted — but the caller's header is still on the request, and an
+        // inner instance with the default `acceptIncoming: true` would happily
+        // read it back and hand it to the handler and the logs.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $response = $this->middlewareWith($generator, acceptIncoming: false)
+            ->process($this->request(self::INCOMING_ID), $outerHandler);
+
+        Assert::same($generator->calls, 1);
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
+    }
+
+    public function anInnerInstanceRestoresTheScopeAHandlerWroteOverOutOfBand(): void
+    {
+        // The inner instance does not own the scope, so it must not clear it on
+        // the way out — the outer instance is still unwinding, and anything
+        // decorating the response between the two layers reads the holder.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler(function (): void {
+            $this->holder->override('written by the handler out of band');
+        });
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function anInnerInstanceKeepsTheScopeAliveWhileAnExceptionPropagates(): void
+    {
+        // The case the restore-instead-of-clear branch exists for: an error
+        // handler between the two layers logs the failure and needs the ID.
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler(static function (): void {
+            throw new RuntimeException('downstream failure');
+        });
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        try {
+            $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+        } catch (RuntimeException) {
+            // The outer instance's `finally` has run by now; the interesting
+            // window is one frame down, recorded by NestingHandler.
+        }
+
+        Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function theOutermostInstanceStillSelfHealsUnderNesting(): void
+    {
+        // Self-healing and nesting-awareness have to coexist: the stray ID is
+        // still dropped, because only an instance that found the attribute
+        // treats itself as nested.
+        $this->holder->set('left behind by worker bootstrap');
+        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = new FakeHandler();
+        $outerHandler = new NestingHandler(
+            $this->middlewareWith($generator),
+            $leaf,
+            $this->holder,
+        );
+
+        $response = $this->middlewareWith($generator)->process($this->request(), $outerHandler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::null($this->holder->tryGet());
+    }
+
+    public function anAlreadyPublishedAttributeWinsOverTheIncomingHeader(): void
+    {
+        $handler = new FakeHandler();
+        $request = $this->request(self::INCOMING_ID)
+            ->withAttribute('correlationId', self::SECOND_GENERATED_ID);
+
+        $response = $this->middleware()->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::SECOND_GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::SECOND_GENERATED_ID);
+        Assert::same($this->generator->calls, 0);
+    }
+
+    #[DataProvider('unadoptableAttributeProvider')]
+    public function ignoresARequestAttributeThatIsNotAnAcceptableId(mixed $attribute): void
+    {
+        // Only this middleware is supposed to write that attribute, but nothing
+        // enforces it — a route parameter or an unrelated middleware sharing
+        // the name must not get to decide the correlation ID.
+        $handler = new FakeHandler();
+        $request = $this->request()->withAttribute('correlationId', $attribute);
+
+        $response = $this->middleware()->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->generator->calls, 1);
+    }
+
+    public static function unadoptableAttributeProvider(): iterable
+    {
+        yield 'not a uuid' => ['not-a-uuid'];
+        yield 'empty string' => [''];
+        yield 'over max length' => [str_repeat('a', 129)];
+        yield 'control character' => [self::INCOMING_ID . "\n"];
+        yield 'not a string at all' => [42];
+        yield 'array' => [[self::INCOMING_ID]];
+        // A Stringable is not a string: adopting it would mean the ID reaching
+        // the holder had never been through the validation contract.
+        yield 'stringable object' => [new class implements Stringable {
+            #[\Override]
+            public function __toString(): string
+            {
+                return 'aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee';
+            }
+        }];
+    }
+
+    public function theDefaultPatternRejectsATrailingNewlineOnItsOwn(): void
+    {
+        // The whole point of the `\z` anchor, seen from a consumer reusing the
+        // constant outside the middleware — validating a queue message's
+        // correlation id before `runWith()`, with none of the middleware's
+        // guards in the way. Up to 1.0.1 this constant was `$`-anchored and
+        // returned 1 for the first subject.
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, self::INCOMING_ID . "\n"), 0);
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, self::INCOMING_ID), 1);
+    }
+
+    /**
+     * The load-bearing one: a `$`-anchored pattern accepts `"<uuid>\n"` on its
+     * own, and the middleware still does not, because `isAcceptable()` runs
+     * the control-character guard before any pattern. That is what makes the
+     * anchor of a *user-supplied* `validationPattern` irrelevant inside
+     * `process()` — the 1.0.1 default was exactly such a pattern.
+     */
+    #[DataProvider('bothAnchorsProvider')]
+    public function rejectsATrailingNewlineUnderEitherAnchor(string $validationPattern): void
+    {
+        $handler = new FakeHandler();
+        // nyholm's own header-value check is `$`-anchored, so a single
+        // trailing `\n` really does reach the middleware.
+        $request = $this->request(self::INCOMING_ID . "\n");
+
+        $response = $this->middleware(validationPattern: $validationPattern)->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->generator->calls, 1);
+    }
+
+    /**
+     * The same, from the request attribute an outer instance of the middleware
+     * would have published: that path validates too, and it validates the same
+     * way under either anchor.
+     */
+    #[DataProvider('bothAnchorsProvider')]
+    public function refusesToAdoptAnAttributeWithATrailingNewlineUnderEitherAnchor(string $validationPattern): void
+    {
+        $handler = new FakeHandler();
+        $request = $this->request()->withAttribute('correlationId', self::INCOMING_ID . "\n");
+
+        $response = $this->middleware(validationPattern: $validationPattern)->process($request, $handler);
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
+        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->generator->calls, 1);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function bothAnchorsProvider(): iterable
+    {
+        yield '\z-anchored default' => [CorrelationIdMiddleware::UUID_V4_PATTERN];
+        // Spelled out rather than derived from the constant: this is a
+        // user-supplied loose pattern (and, historically, the 1.0.1 default),
+        // and it must keep testing that shape after the constant moves on.
+        yield 'user-supplied $-anchored' => ['/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i'];
+    }
+
+    /**
+     * The published constant and the constructor's published default parameter
+     * value are two separate things backward-compatibility tooling compares.
+     * They must not drift apart.
+     */
+    public function theConstantIsTheDefaultValidationPattern(): void
+    {
+        $parameters = (new ReflectionClass(CorrelationIdMiddleware::class))
+            ->getConstructor()
+            ?->getParameters() ?? [];
+
+        $defaults = [];
+
+        foreach ($parameters as $parameter) {
+            if ($parameter->getName() === 'validationPattern') {
+                $defaults[] = $parameter->getDefaultValue();
+            }
+        }
+
+        Assert::same($defaults, [CorrelationIdMiddleware::UUID_V4_PATTERN]);
+    }
+
+    #[DataProvider('controlCharacterProvider')]
+    public function rejectsAGeneratedIdCarryingAControlCharacterUnderAPermissivePattern(string $generated): void
+    {
+        $this->generator = new FixedGenerator($generated);
+        $handler = new FakeHandler();
+
+        Expect::exception(UnexpectedValueException::class)
+            ->withMessageContaining('does not satisfy validationPattern and maxLength');
+
+        try {
+            $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)->process($this->request(), $handler);
+        } finally {
+            Assert::null($handler->handledRequest);
+        }
+    }
+
+    public static function controlCharacterProvider(): iterable
+    {
+        yield 'nul byte' => ["opaque\x00token"];
+        yield 'ansi osc escape' => ["opaque\x1B]0;pwned\x07token"];
+        yield 'tab' => ["opaque\ttoken"];
+        yield 'delete' => ["opaque\x7Ftoken"];
+        yield 'carriage return' => ["opaque\rtoken"];
+        yield 'line feed' => ["opaque\ntoken"];
+        yield 'backspace' => ["opaque\x08token"];
+        yield 'unit separator, top of the control range' => ["opaque\x1Ftoken"];
+        yield 'start of heading, bottom of the control range' => ["\x01opaque"];
+        yield 'trailing escape' => ["opaque\x1B"];
+    }
+
+    #[DataProvider('controlFreeIdProvider')]
+    public function acceptsAControlFreeIdUnderAPermissivePattern(string $generated): void
+    {
+        $this->generator = new FixedGenerator($generated);
+
+        $response = $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)
+            ->process($this->request(), new FakeHandler());
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), $generated);
+    }
+
+    public static function controlFreeIdProvider(): iterable
+    {
+        yield 'opaque token' => ['01ARZ3NDEKTSV4RRFFQ69G5FAV'];
+        yield 'space, one above the control range' => ['opaque token'];
+        yield 'tilde, one below delete' => ['opaque~token'];
+        yield 'high byte, one above delete' => ["opaque\x80token"];
+    }
+
+    #[DataProvider('incomingControlCharacterProvider')]
+    public function rejectsAnIncomingIdCarryingAControlCharacterUnderAPermissivePattern(string $incoming): void
+    {
+        $this->generator = new FixedGenerator('generated-id');
+
+        $response = $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)
+            ->process($this->request($incoming), new FakeHandler());
+
+        Assert::same($response->getHeaderLine('X-Request-ID'), 'generated-id');
+    }
+
+    public static function incomingControlCharacterProvider(): iterable
+    {
+        // Only header values a conforming PSR-7 implementation lets through:
+        // nyholm accepts TAB, and its own `$`-anchored value check accepts a
+        // single trailing LF — exactly the smuggling this guard has to stop.
+        yield 'tab' => ["opaque\ttoken"];
+        yield 'trailing line feed' => ["opaque-token\n"];
+    }
+
     public function overwritesAnIdHeaderSetDownstream(): void
     {
         $handler = new FakeHandler();
@@ -322,7 +742,14 @@ final class CorrelationIdMiddlewareTest
     public function responseAlwaysCarriesAnIdAcceptedByTheDefaultPattern(string $incoming): void
     {
         $holder = new CorrelationIdHolder();
-        $middleware = new CorrelationIdMiddleware(generator: new Uuidv4Generator(), holder: $holder);
+        // `acceptIncoming: true` explicitly — the property is about what the
+        // middleware lets through from the wire, and the default is now to
+        // ignore the wire entirely.
+        $middleware = new CorrelationIdMiddleware(
+            generator: new Uuidv4Generator(),
+            holder: $holder,
+            acceptIncoming: true,
+        );
 
         $response = $middleware->process(
             (new ServerRequest('GET', '/'))->withHeader('X-Request-ID', $incoming),
@@ -367,6 +794,8 @@ final class CorrelationIdMiddlewareTest
         yield 'wrong variant' => ['aaaaaaaa-bbbb-4ccc-1ddd-eeeeeeeeeeee'];
         yield 'trailing garbage' => [self::INCOMING_ID . '-extra'];
         yield 'over max length' => [str_repeat('a', 129)];
+        yield 'trailing line feed' => [self::INCOMING_ID . "\n"];
+        yield 'tab-smuggled content' => [self::INCOMING_ID . "\tX-Evil: 1"];
     }
 
     #[Property(runs: 300, timeoutMs: 1000)]
@@ -375,6 +804,7 @@ final class CorrelationIdMiddlewareTest
         $middleware = new CorrelationIdMiddleware(
             generator: new FixedGenerator(self::GENERATED_ID),
             holder: new CorrelationIdHolder(),
+            acceptIncoming: true,
         );
 
         $acceptable = $incoming !== ''
@@ -409,12 +839,29 @@ final class CorrelationIdMiddlewareTest
         ];
     }
 
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function reusesTheIncomingIdExactlyWhenTheDefaultPatternAcceptsItExamples(): iterable
+    {
+        yield 'canonical incoming id' => [self::INCOMING_ID];
+        yield 'uppercase incoming id' => [strtoupper(self::INCOMING_ID)];
+        // nyholm's own header-value check is `$`-anchored, so this reaches the
+        // middleware; both the pattern's `\z` and the control-character guard
+        // have to turn it down.
+        yield 'trailing line feed' => [self::INCOMING_ID . "\n"];
+        yield 'tab-smuggled content' => [self::INCOMING_ID . "\tX-Evil: 1"];
+        yield 'space-smuggled content' => [self::INCOMING_ID . ' X-Evil: 1'];
+        yield 'empty header value' => [''];
+    }
+
     #[Property(runs: 200, timeoutMs: 1000)]
     public function maxLengthRejectsAnIncomingIdTheCustomPatternWouldAccept(string $incoming, int $maxLength): void
     {
         $middleware = new CorrelationIdMiddleware(
             generator: new FixedGenerator('generated'),
             holder: new CorrelationIdHolder(),
+            acceptIncoming: true,
             validationPattern: self::LOWERCASE_PATTERN,
             maxLength: $maxLength,
         );
@@ -461,6 +908,100 @@ final class CorrelationIdMiddlewareTest
         yield 'single character under a wide limit' => ['a', 20];
     }
 
+    /**
+     * The `\z` anchor of `UUID_V4_PATTERN`, checked from a consumer's
+     * position: nothing here goes through the middleware, so none of its
+     * compensating guards can hide a slack anchor. The `$`-anchored 1.0.1
+     * spelling of this constant fails this property — that is exactly the bug
+     * 2.0.0 fixes.
+     */
+    #[Property(runs: 400, timeoutMs: 1000)]
+    public function theDefaultPatternAcceptsExactlyCanonicalUuidV4Strings(string $candidate): void
+    {
+        $structural = $this->looksLikeUuidV4($candidate);
+
+        Classify::cover($structural, 'canonical uuid v4', 20.0);
+        Classify::cover(!$structural, 'not a uuid v4', 20.0);
+        Classify::when(str_contains($candidate, "\n"), 'contains a line feed');
+
+        Assert::same(preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $candidate) === 1, $structural);
+    }
+
+    /**
+     * @return array<string, ArbitraryInterface>
+     */
+    public static function theDefaultPatternAcceptsExactlyCanonicalUuidV4StringsGenerators(): array
+    {
+        return [
+            'candidate' => Gen::frequency([
+                [3, Gen::uuid()],
+                [1, Gen::map(Gen::uuid(), static fn(string $id): string => strtoupper($id))],
+                // The trap itself: a canonical UUID plus one trailing newline.
+                [2, Gen::map(Gen::uuid(), static fn(string $id): string => $id . "\n")],
+                // Header-legal and header-illegal near misses drawn from an
+                // alphabet that mixes hex, the separator and control bytes — no
+                // Assume, both verdicts arise naturally.
+                [3, Gen::stringFrom("0123456789abcdefABCDEF-\n\r\t\x00\x1B", minLength: 0, maxLength: 40)],
+            ]),
+        ];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function theDefaultPatternAcceptsExactlyCanonicalUuidV4StringsExamples(): iterable
+    {
+        yield 'canonical' => [self::INCOMING_ID];
+        yield 'uppercase' => [strtoupper(self::INCOMING_ID)];
+        yield 'trailing line feed' => [self::INCOMING_ID . "\n"];
+        yield 'trailing carriage return' => [self::INCOMING_ID . "\r"];
+        yield 'leading line feed' => ["\n" . self::INCOMING_ID];
+        yield 'two trailing line feeds' => [self::INCOMING_ID . "\n\n"];
+        yield 'trailing nul byte' => [self::INCOMING_ID . "\x00"];
+        yield 'trailing ansi escape' => [self::INCOMING_ID . "\x1B[31m"];
+        yield 'empty' => [''];
+        yield 'uuid v1' => ['aaaaaaaa-bbbb-1ccc-9ddd-eeeeeeeeeeee'];
+        yield 'wrong variant' => ['aaaaaaaa-bbbb-4ccc-1ddd-eeeeeeeeeeee'];
+        yield 'nul byte inside the last group' => ["aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeee\x00e"];
+    }
+
+    /**
+     * A second, deliberately different spelling of "canonical UUID v4": no
+     * regex, so it cannot share a bug with the constant under test.
+     */
+    private function looksLikeUuidV4(string $value): bool
+    {
+        if (strlen($value) !== 36) {
+            return false;
+        }
+
+        $lower = strtolower($value);
+
+        if ($lower[8] !== '-' || $lower[13] !== '-' || $lower[18] !== '-' || $lower[23] !== '-') {
+            return false;
+        }
+
+        if ($lower[14] !== '4' || !in_array($lower[19], ['8', '9', 'a', 'b'], strict: true)) {
+            return false;
+        }
+
+        foreach ([[0, 8], [9, 4], [15, 3], [20, 3], [24, 12]] as [$offset, $length]) {
+            if (!ctype_xdigit(substr($lower, $offset, $length))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * `$acceptIncoming` defaults to true here and false in the middleware, on
+     * purpose: most tests below are about what happens to an incoming header,
+     * and they would all become vacuous under the production default. The
+     * production default has its own dedicated test
+     * (`ignoresTheIncomingIdByDefault`), which constructs the middleware
+     * directly and passes no argument.
+     */
     private function middleware(
         string $headerName = 'X-Request-ID',
         string $attributeName = 'correlationId',
@@ -478,6 +1019,21 @@ final class CorrelationIdMiddlewareTest
             validationPattern: $validationPattern,
             maxLength: $maxLength,
             incomingPolicy: $incomingPolicy,
+        );
+    }
+
+    /**
+     * The nesting tests need two instances drawing from one generator that
+     * answers differently every call — `$this->generator` is fixed by design.
+     */
+    private function middlewareWith(
+        CorrelationIdGenerator $generator,
+        bool $acceptIncoming = true,
+    ): CorrelationIdMiddleware {
+        return new CorrelationIdMiddleware(
+            generator: $generator,
+            holder: $this->holder,
+            acceptIncoming: $acceptIncoming,
         );
     }
 

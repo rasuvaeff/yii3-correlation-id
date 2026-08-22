@@ -45,12 +45,16 @@ $middleware = new CorrelationIdMiddleware(
 
 For each request the middleware:
 
-1. Reads `X-Request-ID` and reuses the value if it is acceptable.
-2. Generates a UUIDv4 otherwise.
-3. Publishes the ID as the `correlationId` request attribute.
-4. Publishes the ID in `CorrelationIdHolder`.
-5. Clears the holder in a `finally` block.
-6. Sets `X-Request-ID` on the response.
+1. Adopts the ID an outer instance of itself already published in the
+   `correlationId` request attribute, if there is one.
+2. Otherwise reads `X-Request-ID` and reuses the value if it is acceptable —
+   only when configured with `acceptIncoming: true`, which is not the default.
+3. Generates a UUIDv4 otherwise.
+4. Publishes the ID as the `correlationId` request attribute.
+5. Publishes the ID in `CorrelationIdHolder`, replacing whatever was there.
+6. Clears the holder in a `finally` block — unless it adopted the ID at step 1,
+   in which case the outer instance owns the cleanup.
+7. Sets `X-Request-ID` on the response.
 
 Under `yiisoft/config` the bundled `config/di.php` wires all of this from
 `params.php`, so the middleware only needs adding to your middleware stack.
@@ -82,7 +86,7 @@ return [
     'rasuvaeff/yii3-correlation-id' => [
         'headerName' => 'X-Request-ID',
         'attributeName' => 'correlationId',
-        'acceptIncoming' => false, // public ingress mints its own ID
+        'acceptIncoming' => false, // the default: the caller does not choose this service's ID
         'validationPattern' => CorrelationIdMiddleware::UUID_V4_PATTERN,
         'maxLength' => 128,
         'contextKey' => 'requestId',
@@ -116,6 +120,31 @@ writes it and everything else reads it. The `yiisoft/di` container does this by
 autowiring. The package aliases `CorrelationIdProvider` to that same instance;
 application services should not depend on the holder's mutation methods.
 
+The middleware **owns** the request scope: it overwrites whatever the holder
+held and clears it in `finally`. A stray ID — left by worker bootstrap or by a
+handler that called `exit()` — is dropped on the next request instead of failing
+every request that worker will ever handle again. `set()` keeps its set-once
+contract for application and queue code, where a second write really is a
+mistake.
+
+### Registered twice
+
+A second instance further down the stack — the middleware added twice, a module
+that ships its own copy — **adopts** the ID the outer one already published in
+the request attribute. It does not read the incoming header again, does not mint
+a rival ID, and does not clear the holder on the way out, since the scope
+belongs to the outer instance. Without that, one request would carry two IDs:
+the inner one in the logs and the handler, the outer one in the response header.
+
+It also keeps `acceptIncoming: false` meaningful: the caller's header is still on
+the request after the outer instance decided to ignore it, and an inner instance
+configured with `acceptIncoming: true` would otherwise read it right back.
+
+The attribute is adopted only after passing the same control-character,
+`maxLength` and `validationPattern` checks as an incoming header, so unrelated
+code writing that attribute (a route parameter of the same name) cannot decide
+the correlation ID.
+
 ### Queue and console scopes
 
 Queue consumers and console commands can establish an explicit scope without
@@ -129,8 +158,23 @@ $result = $holder->runWith(
 );
 ```
 
-Scope IDs come from trusted application infrastructure and bypass the HTTP
-validation settings. Do not pass arbitrary user input to `runWith()`.
+`set()`, `override()` and `runWith()` each validate their argument and throw
+`InvalidArgumentException` for an ID that is empty, longer than 4096 bytes, or
+carrying a control character (`\x00`-`\x1F`, `\x7F`). That matters most here:
+`$message->correlationId` above usually started life as an untrusted HTTP header
+on the service that enqueued the job, and from the holder it reaches every log
+line and every outgoing request header verbatim.
+
+Validation happens before the holder's state is touched, so a rejected call
+leaves the current scope exactly as it was and the callback never runs. The
+4096-byte ceiling is a sanity limit against log bloat, not a format check — it
+sits far above the middleware's `maxLength` default of 128, so a custom format
+configured on the middleware is never rejected by the holder afterwards.
+
+The holder's guarantee is deliberately minimal: it is not the HTTP validation
+contract. If a scope ID must match a specific format, check it against
+`CorrelationIdMiddleware::UUID_V4_PATTERN` (or your own pattern) before calling
+`runWith()`.
 
 ### Outgoing HTTP requests
 
@@ -185,8 +229,8 @@ provider returns an empty array, and logging keeps working.
 | Param | Default | Meaning |
 |---|---|---|
 | `headerName` | `X-Request-ID` | Read from the request, written to the response |
-| `attributeName` | `correlationId` | Request attribute carrying the ID |
-| `acceptIncoming` | `true` | Reuse acceptable caller IDs; use `false` at a public trust boundary that mints IDs |
+| `attributeName` | `correlationId` | Request attribute carrying the ID; also how a nested instance recognises the outer one's scope |
+| `acceptIncoming` | `false` | Ignore the caller's ID and mint one here. Set it to `true` only on a service that direct client traffic cannot reach, to keep the ID propagating across hops |
 | `validationPattern` | UUIDv4 regex | Invalid incoming IDs are replaced; invalid generated IDs are rejected |
 | `maxLength` | `128` | Longer incoming IDs are replaced; longer generated IDs are rejected |
 | `contextKey` | `requestId` | Log context key |
@@ -195,6 +239,50 @@ A custom ID format needs a generator, matching pattern, and sufficient maximum
 length. A generated value outside that contract throws `UnexpectedValueException`
 before the request handler runs. See
 [examples/04-custom-generator.php](examples/04-custom-generator.php).
+
+Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before
+`validationPattern` runs, so a permissive custom pattern cannot let an ANSI
+escape, a NUL byte, or a smuggled newline reach the holder, the logs, or an
+outgoing header.
+
+### Trusting the caller's ID
+
+`acceptIncoming` defaults to `false`. A middleware that has not been told where
+it sits assumes a public trust boundary and mints its own ID, so a caller cannot
+choose what this service's logs are keyed by, nor make two unrelated requests
+share one ID.
+
+Set it to `true` on a service that direct client traffic cannot reach, where the
+forwarded ID keeps the two services' logs correlated:
+
+```php
+// config/common/params.php — internal service behind a gateway
+return [
+    'rasuvaeff/yii3-correlation-id' => [
+        'acceptIncoming' => true,
+    ],
+];
+```
+
+Prior to 2.0.0 the default was `true`; see [UPGRADE.md](UPGRADE.md).
+
+### The UUID constant
+
+`CorrelationIdMiddleware::UUID_V4_PATTERN` is the default `validationPattern`
+and is safe to reuse on its own — validating a queue message's correlation id
+before `runWith()`, checking an ID read back from a database:
+
+```php
+if (preg_match(CorrelationIdMiddleware::UUID_V4_PATTERN, $id) !== 1) {
+    $id = $generator->generate();
+}
+```
+
+It is anchored with `\z`, which matches only at the very end of the subject.
+Up to 1.0.1 it was anchored with `$`, which PCRE also matches before a single
+trailing `\n` — so the old value returned `1` for `"<uuid>\n"` when used this
+way. Middleware behaviour never differed: the control-character guard rejects a
+trailing newline before any pattern runs.
 
 ### Incoming trust policy
 
@@ -226,8 +314,9 @@ return [
 
 For manual construction, pass it as the named `incomingPolicy` argument.
 
-`acceptIncoming: false` remains the hard off switch: it skips the policy and
-always mints a new ID. See
+`acceptIncoming: false` — the default — is the hard off switch: it skips the
+policy and always mints a new ID, so a policy is only ever consulted on a
+middleware configured with `acceptIncoming: true`. See
 [examples/07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php).
 
 ### Public API
@@ -236,7 +325,7 @@ always mints a new ID. See
 |---|---|
 | `CorrelationIdMiddleware` | PSR-15 middleware: resolve, publish, echo back |
 | `CorrelationIdProvider` | Read-only `get`/`tryGet` access for application services |
-| `CorrelationIdHolder` | Mutable infrastructure holder with set-once operations and `runWith()` scopes |
+| `CorrelationIdHolder` | Mutable infrastructure holder: set-once `set()`, unconditional `override()`, and `runWith()` scopes. Every write validates the ID |
 | `CorrelationIdGenerator` | Interface for ID generation |
 | `Uuidv4Generator` | Pure-PHP RFC 4122 v4 UUIDs from `random_bytes()` |
 | `CorrelationIdContextProvider` | `yiisoft/log` context provider adding `requestId` |
@@ -287,10 +376,10 @@ if ($id !== null) {
 
 | Risk | What the package does |
 |---|---|
-| Header injection | A conforming PSR-7 implementation already rejects CRLF in a header value; the validation pattern additionally rejects anything that is not a well-formed ID, including content smuggled after a space or a tab |
+| Header injection | Control characters (`\x00`-`\x1F`, `\x7F`) are rejected unconditionally, before `validationPattern`, so a permissive custom pattern stays safe; the pattern then rejects anything that is not a well-formed ID, including content smuggled after a space |
 | Oversized header | `maxLength` (default 128) rejects long values before the pattern runs |
-| Client-spoofed ID | Set `acceptIncoming: false` at the public gateway; internal services accept that trusted ID and must not be directly reachable by clients |
-| Log injection | Both incoming and generated IDs must pass the validation pattern and length limit before reaching the holder or log context |
+| Client-spoofed ID | `acceptIncoming` defaults to `false`, so a caller's ID is ignored unless the service explicitly opts in. Opt in only on internal services that direct client traffic cannot reach |
+| Log injection | Both incoming and generated IDs must pass the control-character guard, the validation pattern, and the length limit before reaching the holder or log context. The guard runs first, so the anchor of `validationPattern` cannot weaken the middleware. `CorrelationIdHolder` applies its own control-character and length guard to `set()`, `override()` and `runWith()`, so an ID entering from a queue or console path cannot carry an ANSI escape or a CR/LF into the logs or an outgoing header either |
 | Info leak | A request ID carries no user data. UUIDv4 is unguessable but is **not** a secret — never use it for authorization |
 
 **Browser access.** CORS does not expose custom response headers to JavaScript
@@ -317,13 +406,13 @@ documented public API.
 
 | Script | Shows | Needs server? |
 |---|---|---|
-| [01-middleware-setup.php](examples/01-middleware-setup.php) | Middleware in a PSR-15 stack: generate / reuse / replace | no |
+| [01-middleware-setup.php](examples/01-middleware-setup.php) | Middleware in a PSR-15 stack under `acceptIncoming: true`: generate / reuse / replace | no |
 | [02-log-context.php](examples/02-log-context.php) | `yiisoft/log` + context provider: `requestId` on every line | no |
 | [03-access-in-action.php](examples/03-access-in-action.php) | Reading the ID from the attribute and from the holder | no |
 | [04-custom-generator.php](examples/04-custom-generator.php) | ULID-like generator with a matching validation pattern | no |
 | [05-gateway-mode.php](examples/05-gateway-mode.php) | Public gateway replaces an untrusted ID, internal service preserves the gateway ID | no |
 | [06-outgoing-request.php](examples/06-outgoing-request.php) | Queue scope and outgoing PSR-7 header propagation | no |
-| [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Accept a valid incoming ID only from a trusted gateway IP | no |
+| [07-trusted-proxy-policy.php](examples/07-trusted-proxy-policy.php) | Accept a valid incoming ID only from a trusted gateway IP (needs `acceptIncoming: true`) | no |
 
 ## Development
 

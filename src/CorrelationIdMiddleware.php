@@ -19,18 +19,37 @@ use UnexpectedValueException;
  * Place it first in the stack — everything downstream that logs should already
  * see the ID.
  *
+ * A second instance further down the stack (the middleware registered twice,
+ * a module that adds its own copy) adopts the ID the outer one already
+ * published in the request attribute instead of minting a rival, so the logs,
+ * the handler and the response header never disagree.
+ *
  * @api
  */
 final readonly class CorrelationIdMiddleware implements MiddlewareInterface
 {
-    public const string UUID_V4_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i';
+    /**
+     * The canonical UUID v4 format, anchored with `\z` — which matches only at
+     * the very end of the subject, unlike `$`, which PCRE also matches before
+     * a single trailing `\n`.
+     *
+     * The default `$validationPattern`, and safe to reuse on its own outside
+     * the middleware: validating a queue message's correlation id before
+     * `runWith()`, checking an ID read back from a database. Up to 1.0.1 this
+     * constant was `$`-anchored and accepted `"<uuid>\n"` when used that way.
+     */
+    public const string UUID_V4_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i';
+
+    private const string CONTROL_CHARACTER_PATTERN = '/[\x00-\x1F\x7F]/';
 
     /**
      * @param string $headerName Read from the request and written to the response.
      * @param string $attributeName Request attribute carrying the ID downstream.
-     * @param bool $acceptIncoming Whether a caller-sent ID may be reused. Set it
-     * to false at a public trust boundary that must mint its own ID. Services
-     * behind a trusted gateway normally keep it true to preserve propagation.
+     * @param bool $acceptIncoming Whether a caller-sent ID may be reused.
+     * Defaults to false: a middleware that has not been told where it sits
+     * assumes a public trust boundary and mints its own ID, so the caller
+     * cannot choose what the logs are keyed by. Set it to true on a service
+     * behind a trusted gateway to keep the ID propagating across hops.
      * @param non-empty-string $validationPattern Incoming and generated IDs must
      * match this pattern.
      * @param int $maxLength Incoming and generated IDs may not exceed this length.
@@ -44,7 +63,7 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
         private CorrelationIdHolder $holder,
         private string $headerName = 'X-Request-ID',
         private string $attributeName = 'correlationId',
-        private bool $acceptIncoming = true,
+        private bool $acceptIncoming = false,
         private string $validationPattern = self::UUID_V4_PATTERN,
         private int $maxLength = 128,
         private IncomingCorrelationIdPolicy $incomingPolicy = new AcceptAllIncomingCorrelationIdPolicy(),
@@ -65,16 +84,51 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
     #[\Override]
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {
-        $id = $this->resolveId($request);
-        $this->holder->set($id);
+        // Non-null exactly when an outer instance of this middleware already
+        // owns the scope; the ID is then adopted rather than re-decided.
+        $published = $this->publishedId($request);
+        $id = $published ?? $this->resolveId($request);
+        // `override()`, not `set()`: the middleware owns the request scope
+        // rather than asserting it is the first writer. A stray ID left in the
+        // holder (worker bootstrap that forgot to clear, a handler that called
+        // `exit()`, the middleware registered twice) is dropped on the next
+        // request instead of making `set()` throw on every request this worker
+        // ever handles again. `set()` keeps its set-once contract for
+        // application and queue code.
+        $this->holder->override($id);
 
         try {
             $response = $handler->handle($request->withAttribute($this->attributeName, $id));
         } finally {
-            $this->holder->clear();
+            if ($published === null) {
+                $this->holder->clear();
+            } else {
+                // Nested instance: the scope belongs to the outer one, which
+                // clears it itself. Clearing here would blank the holder for
+                // every reader sitting between the two layers; restoring the
+                // adopted ID also undoes a handler that wrote the holder
+                // out of band. Only the outermost instance self-heals.
+                $this->holder->override($published);
+            }
         }
 
         return $response->withHeader($this->headerName, $id);
+    }
+
+    /**
+     * The request attribute is populated server-side only — never from the
+     * wire — but it still passes the full validation contract before being
+     * adopted, so unrelated code writing that attribute cannot decide the
+     * correlation ID.
+     */
+    private function publishedId(ServerRequestInterface $request): ?string
+    {
+        return $this->adoptable($request->getAttribute($this->attributeName));
+    }
+
+    private function adoptable(mixed $published): ?string
+    {
+        return is_string($published) && $this->isAcceptable($published) ? $published : null;
     }
 
     private function resolveId(ServerRequestInterface $request): string
@@ -103,13 +157,18 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
 
     private function isAcceptable(string $id): bool
     {
-        // PCRE `$` matches before a single trailing `\n`, and PSR-7 does not
-        // guarantee a header value is free of LF/CR (a permissive custom
-        // pattern could otherwise accept a smuggled `<value>\n` as the
-        // correlation ID). Reject any newline explicitly.
+        // Control characters are rejected before the user pattern runs, so the
+        // guarantee holds whatever `validationPattern` is — including a
+        // `$`-anchored one, which on its own would let a trailing `\n`
+        // through. It stops CR/LF smuggled inside one legal header line (PSR-7
+        // does not guarantee a value is free of them, and nyholm's own header
+        // check is `$`-anchored too),
+        // ANSI/OSC escapes that would be replayed by a terminal reading the
+        // logs, and NUL/TAB that corrupt log lines and downstream parsers.
+        // It also rejects the `", "` join of several `X-Request-ID` headers
+        // whenever one of them carries a control byte.
         return $id !== ''
-            && !str_contains($id, "\n")
-            && !str_contains($id, "\r")
+            && preg_match(self::CONTROL_CHARACTER_PATTERN, $id) === 0
             && strlen($id) <= $this->maxLength
             && preg_match($this->validationPattern, $id) === 1;
     }
