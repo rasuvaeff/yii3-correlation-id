@@ -26,15 +26,17 @@ grow them here.
 1. **Verification is mandatory.** Never claim "done" without a fresh green
    `composer build`. "Should work" does not count.
 2. **No suppressions.** No `@psalm-suppress`, no baseline. Fix the root cause.
-3. **Every ID satisfies one validation contract.** Incoming, generated, and
-   attribute-adopted IDs reach the holder, response header, and logs only after
-   passing the control-character guard (`[\x00-\x1F\x7F]`, applied before and
-   independently of the user pattern), `maxLength`, and `validationPattern`.
-   Invalid incoming and attribute values are replaced; an invalid generator
-   result fails before the handler runs. The control-character guard is what
-   makes the anchor of `validationPattern` irrelevant inside the middleware —
-   never remove it, and never "fix" the published `$` anchor of
-   `UUID_V4_PATTERN` in place (see the invariant below).
+3. **No ID reaches a reader unvalidated, by any route.** Two independent
+   guards, not one. In the middleware: incoming, generated, and
+   attribute-adopted IDs pass the control-character guard
+   (`[\x00-\x1F\x7F]`, applied before and independently of the user pattern),
+   `maxLength`, and `validationPattern` before they reach the holder, the
+   response header, or the logs. In `CorrelationIdHolder`: `set()`,
+   `override()` and `runWith()` apply their own non-empty / length / no-control
+   check, because a queue or console caller reaches them without the middleware
+   ever running. Never route a write past either guard, and never make the
+   holder's guard depend on the middleware's configuration — they are separate
+   `@api` boundaries and each cleans its own input.
 4. **Preserve the public contract.** Update README + tests with any API change.
 
 ## Commands
@@ -109,24 +111,31 @@ make release-check
   custom format needs all three to agree. Invalid generated output must fail
   before the handler runs, so business side effects cannot precede a response
   header failure.
-- **Trust boundaries preserve propagation deliberately.** Public ingress may
-  use `acceptIncoming: false` to mint an ID. Internal services behind it keep
-  the default `true` and rely on deployment controls to reject direct traffic.
+- **Propagation is opt-in, and that is a security default.** `acceptIncoming`
+  defaults to `false` as of 2.0.0: a middleware that has not been told where it
+  sits mints its own ID, so a caller cannot pick the key its logs are filed
+  under nor collapse two unrelated requests onto one ID. An internal service
+  that direct client traffic cannot reach sets `true` explicitly to preserve
+  the gateway ID. Do not flip the default back "for convenience" — and when
+  writing an example or a test that is about the incoming header, pass
+  `acceptIncoming: true` explicitly, or it silently stops exercising the path
+  it claims to demonstrate. `IncomingCorrelationIdPolicy` is only ever
+  consulted on the opt-in path.
 - **Concurrency limit is real.** A shared holder is safe for sequential request
   handling (FPM, one-request-at-a-time workers) and unsafe under Swoole
   coroutines. Say so honestly in docs; do not claim blanket worker-safety.
-- **Two UUID constants, and the loose one stays.** `UUID_V4_PATTERN` is
-  `$`-anchored and therefore accepts `"<uuid>\n"` on its own; it is frozen at
-  the value 1.0.1 published, carries `@deprecated`, and remains the default
-  `$validationPattern` and the value in `config/params.php`. The strict
-  spelling lives beside it as `UUID_V4_PATTERN_STRICT` (`\z`), which is what
-  consumers should reuse. Retightening the old constant in place is a BC break
-  (roave reports both the constant value and the default parameter value) for
-  no gain: inside `process()` the control-character guard rejects a trailing
-  newline before either pattern runs, so the two constants are
-  indistinguishable there — `rejectsATrailingNewlineUnderEitherPattern` pins
-  exactly that. Anything a test compares *outside* the middleware should use
-  `UUID_V4_PATTERN_STRICT`.
+- **One UUID constant, `\z`-anchored.** `UUID_V4_PATTERN` ends in `\z` as of
+  2.0.0 (1.0.1 shipped `$`, which PCRE also matches before a single trailing
+  `\n`, so the old value accepted `"<uuid>\n"` when reused on its own). It is
+  the default `$validationPattern` and the value in `config/params.php`.
+  Changing the constant's value is a BC break twice over — roave reports both
+  the constant and the constructor's default parameter value — so it does not
+  move again outside a major. Note what the anchor does *not* affect: inside
+  `process()` the control-character guard rejects a trailing newline before any
+  pattern runs, so a loose user-supplied `validationPattern` is equally safe
+  there. `rejectsATrailingNewlineUnderEitherAnchor` pins exactly that, and
+  deliberately keeps a `$`-anchored pattern spelled out as a test literal so
+  that property keeps being tested after the constant moved on.
 - **Control characters are rejected unconditionally.** A conforming PSR-7
   implementation rejects most of them in a header value, but not all: nyholm's
   own value check is `$`-anchored and lets a single trailing `\n` through. The
@@ -148,7 +157,8 @@ make release-check
 
 ## When you finish
 
-- Update `README.md` (and `examples/` if usage changed); update `CHANGELOG.md`
-  when releasing.
+- Update `README.md` **and `README.ru.md`** (both languages, same commit; and
+  `examples/` if usage changed); update `CHANGELOG.md` when releasing, plus
+  `UPGRADE.md` when a major needs manual steps.
 - Re-run `composer build`; if the change affects the public API or release
   process, also run `make release-check`. Paste the output.

@@ -29,54 +29,27 @@ use UnexpectedValueException;
 final readonly class CorrelationIdMiddleware implements MiddlewareInterface
 {
     /**
-     * The single spelling of the value {@see self::UUID_V4_PATTERN} publishes
-     * and {@see self::__construct()} defaults `$validationPattern` to.
+     * The canonical UUID v4 format, anchored with `\z` — which matches only at
+     * the very end of the subject, unlike `$`, which PCRE also matches before
+     * a single trailing `\n`.
      *
-     * It exists only so that neither of those two references a deprecated
-     * constant: the package's own default is not a caller that should be
-     * warned. Both evaluate to exactly the string 1.0.1 published, which is
-     * what backward-compatibility tooling compares.
-     *
-     * @internal
+     * The default `$validationPattern`, and safe to reuse on its own outside
+     * the middleware: validating a queue message's correlation id before
+     * `runWith()`, checking an ID read back from a database. Up to 1.0.1 this
+     * constant was `$`-anchored and accepted `"<uuid>\n"` when used that way.
      */
-    private const string DEFAULT_VALIDATION_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i';
-
-    /**
-     * Anchored with `$`, which PCRE also matches before a single trailing
-     * `\n`: on its own this pattern accepts `"<uuid>\n"`.
-     *
-     * The value is frozen at exactly what 1.0.1 published. It is public API —
-     * consumers compare against it and pass it back in as
-     * `$validationPattern` — so tightening it in place would break them for a
-     * gain the middleware never needed: `isAcceptable()` rejects every control
-     * character before any pattern runs, so `"<uuid>\n"` is turned down under
-     * this constant just as it is under the strict one.
-     *
-     * @deprecated Use {@see self::UUID_V4_PATTERN_STRICT} when validating IDs
-     * in your own code, where the control-character guard is not there to
-     * compensate for the loose anchor.
-     */
-    public const string UUID_V4_PATTERN = self::DEFAULT_VALIDATION_PATTERN;
-
-    /**
-     * The same format anchored with `\z`, which matches only at the very end
-     * of the subject. Reuse this one outside the middleware — validating a
-     * queue message's correlation id before `runWith()`, say — and a trailing
-     * newline is rejected without a separate check.
-     *
-     * Passing it as `$validationPattern` changes nothing the middleware does:
-     * the control-character guard already covers the difference.
-     */
-    public const string UUID_V4_PATTERN_STRICT = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i';
+    public const string UUID_V4_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/i';
 
     private const string CONTROL_CHARACTER_PATTERN = '/[\x00-\x1F\x7F]/';
 
     /**
      * @param string $headerName Read from the request and written to the response.
      * @param string $attributeName Request attribute carrying the ID downstream.
-     * @param bool $acceptIncoming Whether a caller-sent ID may be reused. Set it
-     * to false at a public trust boundary that must mint its own ID. Services
-     * behind a trusted gateway normally keep it true to preserve propagation.
+     * @param bool $acceptIncoming Whether a caller-sent ID may be reused.
+     * Defaults to false: a middleware that has not been told where it sits
+     * assumes a public trust boundary and mints its own ID, so the caller
+     * cannot choose what the logs are keyed by. Set it to true on a service
+     * behind a trusted gateway to keep the ID propagating across hops.
      * @param non-empty-string $validationPattern Incoming and generated IDs must
      * match this pattern.
      * @param int $maxLength Incoming and generated IDs may not exceed this length.
@@ -90,8 +63,8 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
         private CorrelationIdHolder $holder,
         private string $headerName = 'X-Request-ID',
         private string $attributeName = 'correlationId',
-        private bool $acceptIncoming = true,
-        private string $validationPattern = self::DEFAULT_VALIDATION_PATTERN,
+        private bool $acceptIncoming = false,
+        private string $validationPattern = self::UUID_V4_PATTERN,
         private int $maxLength = 128,
         private IncomingCorrelationIdPolicy $incomingPolicy = new AcceptAllIncomingCorrelationIdPolicy(),
     ) {
@@ -185,11 +158,11 @@ final readonly class CorrelationIdMiddleware implements MiddlewareInterface
     private function isAcceptable(string $id): bool
     {
         // Control characters are rejected before the user pattern runs, so the
-        // guarantee holds whatever `validationPattern` is — including the
-        // `$`-anchored default `UUID_V4_PATTERN`, which on its own would let a
-        // trailing `\n` through. It stops CR/LF smuggled inside one legal
-        // header line (PSR-7 does not guarantee a value is free of them, and
-        // nyholm's own header check is `$`-anchored too),
+        // guarantee holds whatever `validationPattern` is — including a
+        // `$`-anchored one, which on its own would let a trailing `\n`
+        // through. It stops CR/LF smuggled inside one legal header line (PSR-7
+        // does not guarantee a value is free of them, and nyholm's own header
+        // check is `$`-anchored too),
         // ANSI/OSC escapes that would be replayed by a terminal reading the
         // logs, and NUL/TAB that corrupt log lines and downstream parsers.
         // It also rejects the `", "` join of several `X-Request-ID` headers

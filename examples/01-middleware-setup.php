@@ -14,9 +14,14 @@ use Rasuvaeff\Yii3CorrelationId\Uuidv4Generator;
 require dirname(__DIR__) . '/vendor/autoload.php';
 
 $holder = new CorrelationIdHolder();
+// `acceptIncoming: true` is an opt-in: since 2.0.0 the middleware ignores
+// the caller's header by default, so that a service exposed to the public
+// internet does not let its clients choose what its logs are keyed by. This
+// example is about propagation, so it opts in.
 $middleware = new CorrelationIdMiddleware(
     generator: new Uuidv4Generator(),
     holder: $holder,
+    acceptIncoming: true,
 );
 
 $handler = new class implements RequestHandlerInterface {

@@ -25,7 +25,8 @@ $spoofed = 'aaaaaaaa-bbbb-4ccc-9ddd-eeeeeeeeeeee';
 $request = (new ServerRequest('GET', '/orders'))->withHeader('X-Request-ID', $spoofed);
 
 // Public gateway: replace the untrusted client value with an ID minted at the
-// trust boundary.
+// trust boundary. This is the default since 2.0.0; spelled out here because it
+// is the whole point of the example.
 $gateway = new CorrelationIdMiddleware(
     generator: new Uuidv4Generator(),
     holder: new CorrelationIdHolder(),
@@ -40,6 +41,9 @@ echo "gateway ID:   {$gatewayId}\n";
 $internal = new CorrelationIdMiddleware(
     generator: new Uuidv4Generator(),
     holder: new CorrelationIdHolder(),
+    // The deliberate opt-in: this service is unreachable from the internet, so
+    // reusing the forwarded ID keeps the two services' logs correlated.
+    acceptIncoming: true,
 );
 $forwarded = (new ServerRequest('GET', '/orders'))->withHeader('X-Request-ID', $gatewayId);
 $internalId = $internal->process($forwarded, $handler)->getHeaderLine('X-Request-ID');

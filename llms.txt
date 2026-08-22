@@ -23,17 +23,18 @@ composer require rasuvaeff/yii3-correlation-id
   satisfy the same contract or the middleware throws before calling the handler.
 - Control characters (`\x00`-`\x1F`, `\x7F`) are rejected before
   `validationPattern` runs, so the guarantee holds for any custom pattern.
-- Two UUID constants. `UUID_V4_PATTERN` (the default `validationPattern`) is
-  anchored with `$`, which PCRE also matches before a trailing `\n`, so on its
-  own it accepts `"<uuid>\n"`; it is deprecated but frozen, because its value
-  is published API. `UUID_V4_PATTERN_STRICT` is the same format anchored with
-  `\z` — reuse that one for your own validation, no separate newline check
-  needed. Inside the middleware the choice makes no difference: the
-  control-character guard rejects the newline before either pattern runs.
+- One UUID constant. `UUID_V4_PATTERN` (the default `validationPattern`) is
+  anchored with `\z` and is safe to reuse for your own validation — no separate
+  newline check needed. Up to 1.0.1 it was `$`-anchored, which PCRE also matches
+  before a trailing `\n`, so the old value accepted `"<uuid>\n"` on its own.
+  Inside the middleware the anchor never mattered: the control-character guard
+  rejects the newline before any pattern runs.
 - A custom ID format needs a custom generator, matching pattern, and sufficient
   `maxLength`.
-- Use `acceptIncoming: false` at a public trust boundary that mints IDs. Trusted
-  internal services normally keep it true to preserve the gateway ID.
+- `acceptIncoming` defaults to `false`: the caller's ID is ignored and one is
+  minted here. Set it to `true` only on an internal service that direct client
+  traffic cannot reach, to preserve the gateway ID across hops. The default was
+  `true` up to 1.0.1.
 - The middleware owns the request scope: it calls `override()` (not `set()`) and
   clears the holder in `finally`, so a stray ID is dropped rather than turning
   every later request of that worker into an error. Correct for FPM and
@@ -47,6 +48,12 @@ composer require rasuvaeff/yii3-correlation-id
   is adopted.
 - `CorrelationIdHolder::set()` stays set-once (throws `LogicException`) for
   application and queue code; `override()` is unconditional.
+- Every holder write validates: `set()`, `override()` and `runWith()` throw
+  `InvalidArgumentException` for an empty ID, an ID over 4096 bytes, or an ID
+  carrying a control character. Validation runs before the holder's state is
+  touched, so a rejected call changes nothing and `runWith()` never invokes the
+  callback. The ceiling is a log-bloat guard, far above the middleware's
+  `maxLength` default of 128 — it never rejects what the middleware accepted.
 - `Yiisoft\Log\ContextProvider\ContextProviderInterface` is never bound by this
   package — the application composes providers.
 - `CorrelationIdHeaderInjector` replaces the configured header on outgoing
@@ -70,7 +77,7 @@ $middleware = new CorrelationIdMiddleware(
     holder: $holder,
     headerName: 'X-Request-ID',           // default
     attributeName: 'correlationId',       // default
-    acceptIncoming: true,                 // false = mint here, e.g. public gateway
+    acceptIncoming: false,                // default; true = trust the caller's ID
     validationPattern: CorrelationIdMiddleware::UUID_V4_PATTERN, // default
     maxLength: 128,                       // default
 );
@@ -89,15 +96,14 @@ before calling the handler if the generator returns an unacceptable ID.
 Public constants:
 
 ```php
-CorrelationIdMiddleware::UUID_V4_PATTERN;        // '/^…-…$/i'  deprecated, still the default
-CorrelationIdMiddleware::UUID_V4_PATTERN_STRICT; // '/^…-…\z/i' use this in your own code
+CorrelationIdMiddleware::UUID_V4_PATTERN; // '/^…-…\z/i' the default; safe to reuse
 ```
 
-`preg_match(UUID_V4_PATTERN, "<uuid>\n") === 1`, because PCRE `$` matches
-before a single trailing newline; `UUID_V4_PATTERN_STRICT` returns 0. Passing
-either as `validationPattern` gives identical middleware behaviour — the
-control-character guard runs first. The loose constant is kept, deprecated
-rather than retightened, because its literal value is published API.
+`preg_match(UUID_V4_PATTERN, "<uuid>\n") === 0`. Up to 1.0.1 the constant was
+`$`-anchored and returned 1 there, because PCRE `$` matches before a single
+trailing newline. Middleware behaviour is identical under either anchor — the
+control-character guard runs first — so the change only affects code using the
+constant on its own.
 
 ### CorrelationIdHolder
 
@@ -109,6 +115,12 @@ $holder->tryGet();        // ?string
 $holder->clear();         // reopens set() for the next request
 $holder->runWith('id', fn () => $work()); // restores previous scope in finally
 ```
+
+`set()`, `override()` and `runWith()` throw `InvalidArgumentException` when the
+ID is empty, longer than 4096 bytes, or carries a control character
+(`\x00`-`\x1F`, `\x7F`) — the argument is checked before the holder's state is
+touched. Validate a queue message's ID against `UUID_V4_PATTERN` (or your own
+pattern) before opening a scope with it.
 
 Inject `CorrelationIdProvider` into application services when only `get()` and
 `tryGet()` are required.
@@ -204,7 +216,7 @@ CORS: `Access-Control-Expose-Headers: X-Request-ID`.
 'rasuvaeff/yii3-correlation-id' => [
     'headerName' => 'X-Request-ID',
     'attributeName' => 'correlationId',
-    'acceptIncoming' => true,
+    'acceptIncoming' => false,
     'validationPattern' => CorrelationIdMiddleware::UUID_V4_PATTERN,
     'maxLength' => 128,
     'contextKey' => 'requestId',

@@ -32,9 +32,12 @@ final readonly class TrustedProxyPolicy implements IncomingCorrelationIdPolicy
     }
 }
 
+// `acceptIncoming: false` (the default since 2.0.0) skips the policy entirely
+// and always mints a fresh ID — the policy only ever runs on the opt-in path.
 $middleware = new CorrelationIdMiddleware(
     generator: new Uuidv4Generator(),
     holder: new CorrelationIdHolder(),
+    acceptIncoming: true,
     incomingPolicy: new TrustedProxyPolicy(['10.0.0.10']),
 );
 $handler = new class implements RequestHandlerInterface {

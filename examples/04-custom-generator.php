@@ -42,6 +42,9 @@ final readonly class UlidLikeGenerator implements CorrelationIdGenerator
 $middleware = new CorrelationIdMiddleware(
     generator: new UlidLikeGenerator(),
     holder: new CorrelationIdHolder(),
+    // Opt in to reusing the caller's ID; the default since 2.0.0 is to ignore
+    // it. Needed here to show the custom pattern accepting and rejecting.
+    acceptIncoming: true,
     validationPattern: '/^[0-9A-HJKMNP-TV-Z]{26}\z/',
     maxLength: 26,
 );
