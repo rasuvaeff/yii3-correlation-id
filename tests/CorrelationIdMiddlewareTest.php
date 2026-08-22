@@ -257,16 +257,17 @@ final class CorrelationIdMiddlewareTest
         Assert::same($seen, self::INCOMING_ID);
     }
 
-    public function keepsServingRequestsAfterAHandlerPoisonsTheHolder(): void
+    public function keepsServingRequestsAfterOutOfBandCodePoisonsTheHolder(): void
     {
         $middleware = $this->middleware();
-        $poisoning = new FakeHandler(function (): void {
-            // Stands in for code that re-enters the holder and never restores
-            // it — the `finally` clear cannot help once the scope is corrupted.
-            $this->holder->override('poisoned');
-        });
 
-        $middleware->process($this->request(self::INCOMING_ID), $poisoning);
+        $middleware->process($this->request(self::INCOMING_ID), new FakeHandler());
+
+        // Between two requests of the same worker: a scheduled task, a bootstrap
+        // hook, anything that writes the holder outside the middleware's own
+        // `finally`. The next request has to survive it.
+        $this->holder->override('poisoned by out-of-band code');
+
         $second = $middleware->process($this->request(), new FakeHandler());
 
         Assert::same($second->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
