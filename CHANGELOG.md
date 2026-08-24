@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- The middleware test suite doubles its collaborators with
+  `rasuvaeff/understudy` (Testo adapter: `rasuvaeff/understudy-testo`) instead
+  of hand-written spies: the `FixedGenerator` call counter became
+  `verify(..., times:)` + `Understudy::nothingElse()`, the `FakeHandler`
+  recording property became the double's call log, and the anonymous policy
+  stubs became `Understudy::for(IncomingCorrelationIdPolicy::class)`. Two
+  property tests now build their doubles inside the property body — the
+  adapter's reset covers a whole property, not one run. Test-only change; the
+  runtime package is untouched.
+
 ## 2.0.0 — 2026-08-22
 
 Three breaking changes, all of them tightenings of a security default. See

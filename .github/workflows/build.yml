@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# TEMPORARY: the Unit suite migrates to rasuvaeff/understudy-testo, which is
+# not published yet. Every installing job clones the core and the adapter
+# next to the package and points two path repositories at them; the pinned
+# `versions` option makes the unreleased packages satisfy `^0.1`. Remove the
+# checkout/config steps (and this comment) once both are tagged on Packagist.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -90,12 +96,31 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout understudy (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy
+          path: understudy
+          persist-credentials: false
+
+      - name: Checkout understudy-testo (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy-testo
+          path: understudy-testo
+          persist-credentials: false
+
+      - name: Configure path repositories
+        run: |
+          composer config repositories.understudy '{"type":"path","url":"./understudy","options":{"versions":{"rasuvaeff/understudy":"0.1.0"}}}'
+          composer config repositories.understudy-testo '{"type":"path","url":"./understudy-testo","options":{"versions":{"rasuvaeff/understudy-testo":"0.1.0"}}}'
+
       - name: Setup PHP
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: ${{ matrix.php }}
           coverage: none
-          extensions: json, mbstring
+          extensions: json, mbstring, tokenizer
           tools: composer:v2
 
       - name: Cache Composer dependencies
@@ -123,12 +148,31 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout understudy (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy
+          path: understudy
+          persist-credentials: false
+
+      - name: Checkout understudy-testo (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy-testo
+          path: understudy-testo
+          persist-credentials: false
+
+      - name: Configure path repositories
+        run: |
+          composer config repositories.understudy '{"type":"path","url":"./understudy","options":{"versions":{"rasuvaeff/understudy":"0.1.0"}}}'
+          composer config repositories.understudy-testo '{"type":"path","url":"./understudy-testo","options":{"versions":{"rasuvaeff/understudy-testo":"0.1.0"}}}'
+
       - name: Setup PHP
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: '8.3'
           coverage: none
-          extensions: json, mbstring
+          extensions: json, mbstring, tokenizer
           tools: composer:v2
 
       - name: Cache Composer dependencies
@@ -156,12 +200,31 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Checkout understudy (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy
+          path: understudy
+          persist-credentials: false
+
+      - name: Checkout understudy-testo (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy-testo
+          path: understudy-testo
+          persist-credentials: false
+
+      - name: Configure path repositories
+        run: |
+          composer config repositories.understudy '{"type":"path","url":"./understudy","options":{"versions":{"rasuvaeff/understudy":"0.1.0"}}}'
+          composer config repositories.understudy-testo '{"type":"path","url":"./understudy-testo","options":{"versions":{"rasuvaeff/understudy-testo":"0.1.0"}}}'
+
       - name: Setup PHP
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: '8.4'
           coverage: pcov
-          extensions: json, mbstring
+          extensions: json, mbstring, tokenizer
           tools: composer:v2
 
       - name: Cache Composer dependencies
@@ -209,12 +272,31 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Checkout understudy (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy
+          path: understudy
+          persist-credentials: false
+
+      - name: Checkout understudy-testo (path repository, see workflow comment)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rasuvaeff/understudy-testo
+          path: understudy-testo
+          persist-credentials: false
+
+      - name: Configure path repositories
+        run: |
+          composer config repositories.understudy '{"type":"path","url":"./understudy","options":{"versions":{"rasuvaeff/understudy":"0.1.0"}}}'
+          composer config repositories.understudy-testo '{"type":"path","url":"./understudy-testo","options":{"versions":{"rasuvaeff/understudy-testo":"0.1.0"}}}'
+
       - name: Setup PHP
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: '8.4'
           coverage: none
-          extensions: json, mbstring, bcmath, intl
+          extensions: json, mbstring, tokenizer, bcmath, intl
           tools: composer:v2
 
       - name: Cache Composer dependencies
