@@ -6,7 +6,14 @@ PCOV_BOOTSTRAP := apk add --no-cache $$PHPIZE_DEPS >/dev/null && pecl install pc
        test-coverage test-coverage-ci update-deps release-check bc-check audit-package
 
 install:
-	$(DOCKER) composer install --no-interaction --no-progress --prefer-dist
+	@# The path repositories are set only for the duration of the install and
+	@# then removed again: composer.json must stay release-ready, and a stray
+	@# `repositories` entry would ship with the tag.
+	$(DOCKER) sh -lc 'composer config repositories.understudy path ../understudy; \
+	  composer config repositories.understudy-testo path ../understudy-testo; \
+	  composer install --no-interaction --no-progress --prefer-dist; status=$$?; \
+	  composer config --unset repositories.understudy-testo; \
+	  composer config --unset repositories.understudy; exit $$status'
 
 bench:
 	$(DOCKER) composer bench

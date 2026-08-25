@@ -5,19 +5,22 @@ declare(strict_types=1);
 namespace Rasuvaeff\Yii3CorrelationId\Tests;
 
 use InvalidArgumentException;
+use Nyholm\Psr7\Response;
 use Nyholm\Psr7\ServerRequest;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\RequestHandlerInterface;
 use Rasuvaeff\PropertyTesting\ArbitraryInterface;
 use Rasuvaeff\PropertyTesting\Classify;
 use Rasuvaeff\PropertyTesting\Gen;
 use Rasuvaeff\PropertyTesting\Property;
+use Rasuvaeff\Understudy\Arg;
+use Rasuvaeff\Understudy\Understudy;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdGenerator;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdHolder;
 use Rasuvaeff\Yii3CorrelationId\CorrelationIdMiddleware;
 use Rasuvaeff\Yii3CorrelationId\IncomingCorrelationIdPolicy;
-use Rasuvaeff\Yii3CorrelationId\Tests\Support\FakeHandler;
-use Rasuvaeff\Yii3CorrelationId\Tests\Support\FixedGenerator;
 use Rasuvaeff\Yii3CorrelationId\Tests\Support\NestingHandler;
-use Rasuvaeff\Yii3CorrelationId\Tests\Support\SequenceGenerator;
 use Rasuvaeff\Yii3CorrelationId\Uuidv4Generator;
 use ReflectionClass;
 use RuntimeException;
@@ -29,6 +32,9 @@ use Testo\Expect;
 use Testo\Lifecycle\BeforeTest;
 use Testo\Test;
 use UnexpectedValueException;
+
+use function Rasuvaeff\Understudy\verify;
+use function Rasuvaeff\Understudy\when;
 
 #[Test]
 #[Covers(CorrelationIdMiddleware::class)]
@@ -44,35 +50,35 @@ final class CorrelationIdMiddlewareTest
     private const string PERMISSIVE_PATTERN = '/^.{1,64}\z/s';
 
     private CorrelationIdHolder $holder;
-    private FixedGenerator $generator;
+    private CorrelationIdGenerator $generator;
 
     #[BeforeTest]
     public function setUp(): void
     {
         $this->holder = new CorrelationIdHolder();
-        $this->generator = new FixedGenerator(self::GENERATED_ID);
+        $this->generator = $this->fixedGenerator(self::GENERATED_ID);
     }
 
     public function reusesAcceptableIncomingId(): void
     {
-        $response = $this->middleware()->process($this->request(self::INCOMING_ID), new FakeHandler());
+        $response = $this->middleware()->process($this->request(self::INCOMING_ID), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
-        Assert::same($this->generator->calls, 0);
+        Understudy::unused($this->generator);
     }
 
     public function generatesIdWhenHeaderIsAbsent(): void
     {
-        $response = $this->middleware()->process($this->request(), new FakeHandler());
+        $response = $this->middleware()->process($this->request(), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($this->generator->calls, 1);
+        verify(fn() => $this->generator->generate(), times: 1);
     }
 
     #[DataProvider('unacceptableIdProvider')]
     public function generatesIdWhenIncomingIsUnacceptable(string $incoming): void
     {
-        $response = $this->middleware()->process($this->request($incoming), new FakeHandler());
+        $response = $this->middleware()->process($this->request($incoming), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
     }
@@ -101,7 +107,7 @@ final class CorrelationIdMiddlewareTest
     {
         $upper = strtoupper(self::INCOMING_ID);
 
-        $response = $this->middleware()->process($this->request($upper), new FakeHandler());
+        $response = $this->middleware()->process($this->request($upper), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), $upper);
     }
@@ -110,10 +116,10 @@ final class CorrelationIdMiddlewareTest
     {
         $middleware = $this->middleware(acceptIncoming: false);
 
-        $response = $middleware->process($this->request(self::INCOMING_ID), new FakeHandler());
+        $response = $middleware->process($this->request(self::INCOMING_ID), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($this->generator->calls, 1);
+        verify(fn() => $this->generator->generate(), times: 1);
     }
 
     /**
@@ -125,13 +131,13 @@ final class CorrelationIdMiddlewareTest
     public function ignoresTheIncomingIdByDefault(): void
     {
         $middleware = new CorrelationIdMiddleware(generator: $this->generator, holder: $this->holder);
-        $handler = new FakeHandler();
+        $handler = $this->handler();
 
         $response = $middleware->process($this->request(self::INCOMING_ID), $handler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
-        Assert::same($this->generator->calls, 1);
+        Assert::same($this->handledRequest($handler)->getAttribute('correlationId'), self::GENERATED_ID);
+        verify(fn() => $this->generator->generate(), times: 1);
     }
 
     /**
@@ -143,9 +149,9 @@ final class CorrelationIdMiddlewareTest
     public function aLongIdTheMiddlewareAcceptsReachesTheHolder(): void
     {
         $long = str_repeat('a', 512);
-        $this->generator = new FixedGenerator($long);
+        $this->generator = $this->fixedGenerator($long);
         $seen = null;
-        $handler = new FakeHandler(function () use (&$seen): void {
+        $handler = $this->observingHandler(function () use (&$seen): void {
             $seen = $this->holder->tryGet();
         });
 
@@ -158,64 +164,46 @@ final class CorrelationIdMiddlewareTest
 
     public function policyMayRejectAValidIncomingId(): void
     {
-        $policy = new class implements IncomingCorrelationIdPolicy {
-            public bool $called = false;
-            public ?string $seenId = null;
-
-            #[\Override]
-            public function accepts(\Psr\Http\Message\ServerRequestInterface $request, string $id): bool
-            {
-                $this->called = true;
-                $this->seenId = $id;
-
-                return false;
-            }
-        };
+        $policy = Understudy::for(IncomingCorrelationIdPolicy::class);
+        when(fn() => $policy->accepts(Arg::any(), Arg::any()))->returns(false);
 
         $response = $this->middleware(incomingPolicy: $policy)
-            ->process($this->request(self::INCOMING_ID), new FakeHandler());
+            ->process($this->request(self::INCOMING_ID), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::true($policy->called);
-        Assert::same($policy->seenId, self::INCOMING_ID);
+        // The exact-argument verify replaces the old spy's `called` flag and
+        // `seenId` recording in one claim: accepted exactly once, for this ID.
+        verify(fn() => $policy->accepts(Arg::any(), self::INCOMING_ID), times: 1);
+        Understudy::nothingElse($policy);
     }
 
     public function policyDoesNotSeeInvalidIncomingId(): void
     {
-        $policy = new class implements IncomingCorrelationIdPolicy {
-            public bool $called = false;
-
-            #[\Override]
-            public function accepts(\Psr\Http\Message\ServerRequestInterface $request, string $id): bool
-            {
-                $this->called = true;
-
-                return true;
-            }
-        };
+        $policy = Understudy::for(IncomingCorrelationIdPolicy::class);
+        when(fn() => $policy->accepts(Arg::any(), Arg::any()))->returns(true);
 
         $this->middleware(incomingPolicy: $policy)
-            ->process($this->request('invalid'), new FakeHandler());
+            ->process($this->request('invalid'), $this->handler());
 
-        Assert::false($policy->called);
+        Understudy::unused($policy);
     }
 
     public function publishesIdAsRequestAttribute(): void
     {
-        $handler = new FakeHandler();
+        $handler = $this->handler();
 
         $this->middleware()->process($this->request(self::INCOMING_ID), $handler);
 
-        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::INCOMING_ID);
+        Assert::same($this->handledRequest($handler)->getAttribute('correlationId'), self::INCOMING_ID);
     }
 
     public function usesConfiguredAttributeName(): void
     {
-        $handler = new FakeHandler();
+        $handler = $this->handler();
 
         $this->middleware(attributeName: 'requestId')->process($this->request(self::INCOMING_ID), $handler);
 
-        Assert::same($handler->handledRequest?->getAttribute('requestId'), self::INCOMING_ID);
+        Assert::same($this->handledRequest($handler)->getAttribute('requestId'), self::INCOMING_ID);
     }
 
     public function usesConfiguredHeaderNameForBothDirections(): void
@@ -223,7 +211,7 @@ final class CorrelationIdMiddlewareTest
         $middleware = $this->middleware(headerName: 'X-Correlation-ID');
         $request = (new ServerRequest('GET', '/'))->withHeader('X-Correlation-ID', self::INCOMING_ID);
 
-        $response = $middleware->process($request, new FakeHandler());
+        $response = $middleware->process($request, $this->handler());
 
         Assert::same($response->getHeaderLine('X-Correlation-ID'), self::INCOMING_ID);
         Assert::same($response->getHeaderLine('X-Request-ID'), '');
@@ -232,7 +220,7 @@ final class CorrelationIdMiddlewareTest
     public function holderCarriesIdWhileTheRequestIsInFlight(): void
     {
         $seen = null;
-        $handler = new FakeHandler(function () use (&$seen): void {
+        $handler = $this->observingHandler(function () use (&$seen): void {
             $seen = $this->holder->tryGet();
         });
 
@@ -243,16 +231,14 @@ final class CorrelationIdMiddlewareTest
 
     public function clearsHolderAfterTheRequest(): void
     {
-        $this->middleware()->process($this->request(self::INCOMING_ID), new FakeHandler());
+        $this->middleware()->process($this->request(self::INCOMING_ID), $this->handler());
 
         Assert::null($this->holder->tryGet());
     }
 
     public function clearsHolderWhenTheHandlerThrows(): void
     {
-        $handler = new FakeHandler(static function (): void {
-            throw new RuntimeException('downstream failure');
-        });
+        $handler = $this->throwingHandler();
 
         try {
             $this->middleware()->process($this->request(self::INCOMING_ID), $handler);
@@ -267,8 +253,8 @@ final class CorrelationIdMiddlewareTest
     {
         $middleware = $this->middleware();
 
-        $first = $middleware->process($this->request(self::INCOMING_ID), new FakeHandler());
-        $second = $middleware->process($this->request(), new FakeHandler());
+        $first = $middleware->process($this->request(self::INCOMING_ID), $this->handler());
+        $second = $middleware->process($this->request(), $this->handler());
 
         Assert::same($first->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
         Assert::same($second->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
@@ -281,7 +267,7 @@ final class CorrelationIdMiddlewareTest
         // request this worker would ever handle again.
         $this->holder->set('left behind by worker bootstrap');
 
-        $response = $this->middleware()->process($this->request(self::INCOMING_ID), new FakeHandler());
+        $response = $this->middleware()->process($this->request(self::INCOMING_ID), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
         Assert::null($this->holder->tryGet());
@@ -291,7 +277,7 @@ final class CorrelationIdMiddlewareTest
     {
         $this->holder->set('left behind by worker bootstrap');
         $seen = null;
-        $handler = new FakeHandler(function () use (&$seen): void {
+        $handler = $this->observingHandler(function () use (&$seen): void {
             $seen = $this->holder->tryGet();
         });
 
@@ -304,14 +290,14 @@ final class CorrelationIdMiddlewareTest
     {
         $middleware = $this->middleware();
 
-        $middleware->process($this->request(self::INCOMING_ID), new FakeHandler());
+        $middleware->process($this->request(self::INCOMING_ID), $this->handler());
 
         // Between two requests of the same worker: a scheduled task, a bootstrap
         // hook, anything that writes the holder outside the middleware's own
         // `finally`. The next request has to survive it.
         $this->holder->override('poisoned by out-of-band code');
 
-        $second = $middleware->process($this->request(), new FakeHandler());
+        $second = $middleware->process($this->request(), $this->handler());
 
         Assert::same($second->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
         Assert::null($this->holder->tryGet());
@@ -319,13 +305,13 @@ final class CorrelationIdMiddlewareTest
 
     public function toleratesBeingRegisteredTwice(): void
     {
-        $leaf = new FakeHandler();
+        $leaf = $this->handler();
         $outerHandler = new NestingHandler($this->middleware(), $leaf, $this->holder);
 
         $response = $this->middleware()->process($this->request(self::INCOMING_ID), $outerHandler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
-        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::INCOMING_ID);
+        Assert::same($this->handledRequest($leaf)->getAttribute('correlationId'), self::INCOMING_ID);
         Assert::same($outerHandler->holderAfterInnerFinished, self::INCOMING_ID);
         Assert::null($this->holder->tryGet());
     }
@@ -335,19 +321,15 @@ final class CorrelationIdMiddlewareTest
         // Without the attribute being adopted, the inner instance mints its own
         // ID: the handler and the logs carry it while the outer instance still
         // writes its own to the response header. One request, two IDs.
-        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
-        $leaf = new FakeHandler();
-        $outerHandler = new NestingHandler(
-            $this->middlewareWith($generator),
-            $leaf,
-            $this->holder,
-        );
+        $generator = $this->sequencedGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = $this->handler();
+        $outerHandler = new NestingHandler($this->middlewareWith($generator), $leaf, $this->holder);
 
         $response = $this->middlewareWith($generator)->process($this->request(), $outerHandler);
 
-        Assert::same($generator->calls, 1);
+        verify(fn() => $generator->generate(), times: 1);
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->handledRequest($leaf)->getAttribute('correlationId'), self::GENERATED_ID);
         Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
         Assert::null($this->holder->tryGet());
     }
@@ -358,20 +340,16 @@ final class CorrelationIdMiddlewareTest
         // be trusted — but the caller's header is still on the request, and an
         // inner instance with the default `acceptIncoming: true` would happily
         // read it back and hand it to the handler and the logs.
-        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
-        $leaf = new FakeHandler();
-        $outerHandler = new NestingHandler(
-            $this->middlewareWith($generator),
-            $leaf,
-            $this->holder,
-        );
+        $generator = $this->sequencedGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = $this->handler();
+        $outerHandler = new NestingHandler($this->middlewareWith($generator), $leaf, $this->holder);
 
         $response = $this->middlewareWith($generator, acceptIncoming: false)
             ->process($this->request(self::INCOMING_ID), $outerHandler);
 
-        Assert::same($generator->calls, 1);
+        verify(fn() => $generator->generate(), times: 1);
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->handledRequest($leaf)->getAttribute('correlationId'), self::GENERATED_ID);
         Assert::same($outerHandler->holderAfterInnerFinished, self::GENERATED_ID);
     }
 
@@ -380,15 +358,11 @@ final class CorrelationIdMiddlewareTest
         // The inner instance does not own the scope, so it must not clear it on
         // the way out — the outer instance is still unwinding, and anything
         // decorating the response between the two layers reads the holder.
-        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
-        $leaf = new FakeHandler(function (): void {
+        $generator = $this->sequencedGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = $this->observingHandler(function (): void {
             $this->holder->override('written by the handler out of band');
         });
-        $outerHandler = new NestingHandler(
-            $this->middlewareWith($generator),
-            $leaf,
-            $this->holder,
-        );
+        $outerHandler = new NestingHandler($this->middlewareWith($generator), $leaf, $this->holder);
 
         $this->middlewareWith($generator)->process($this->request(), $outerHandler);
 
@@ -400,15 +374,9 @@ final class CorrelationIdMiddlewareTest
     {
         // The case the restore-instead-of-clear branch exists for: an error
         // handler between the two layers logs the failure and needs the ID.
-        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
-        $leaf = new FakeHandler(static function (): void {
-            throw new RuntimeException('downstream failure');
-        });
-        $outerHandler = new NestingHandler(
-            $this->middlewareWith($generator),
-            $leaf,
-            $this->holder,
-        );
+        $generator = $this->sequencedGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = $this->throwingHandler();
+        $outerHandler = new NestingHandler($this->middlewareWith($generator), $leaf, $this->holder);
 
         try {
             $this->middlewareWith($generator)->process($this->request(), $outerHandler);
@@ -427,32 +395,28 @@ final class CorrelationIdMiddlewareTest
         // still dropped, because only an instance that found the attribute
         // treats itself as nested.
         $this->holder->set('left behind by worker bootstrap');
-        $generator = new SequenceGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
-        $leaf = new FakeHandler();
-        $outerHandler = new NestingHandler(
-            $this->middlewareWith($generator),
-            $leaf,
-            $this->holder,
-        );
+        $generator = $this->sequencedGenerator(self::GENERATED_ID, self::SECOND_GENERATED_ID);
+        $leaf = $this->handler();
+        $outerHandler = new NestingHandler($this->middlewareWith($generator), $leaf, $this->holder);
 
         $response = $this->middlewareWith($generator)->process($this->request(), $outerHandler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($leaf->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
+        Assert::same($this->handledRequest($leaf)->getAttribute('correlationId'), self::GENERATED_ID);
         Assert::null($this->holder->tryGet());
     }
 
     public function anAlreadyPublishedAttributeWinsOverTheIncomingHeader(): void
     {
-        $handler = new FakeHandler();
+        $handler = $this->handler();
         $request = $this->request(self::INCOMING_ID)
             ->withAttribute('correlationId', self::SECOND_GENERATED_ID);
 
         $response = $this->middleware()->process($request, $handler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::SECOND_GENERATED_ID);
-        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::SECOND_GENERATED_ID);
-        Assert::same($this->generator->calls, 0);
+        Assert::same($this->handledRequest($handler)->getAttribute('correlationId'), self::SECOND_GENERATED_ID);
+        Understudy::unused($this->generator);
     }
 
     #[DataProvider('unadoptableAttributeProvider')]
@@ -461,14 +425,14 @@ final class CorrelationIdMiddlewareTest
         // Only this middleware is supposed to write that attribute, but nothing
         // enforces it — a route parameter or an unrelated middleware sharing
         // the name must not get to decide the correlation ID.
-        $handler = new FakeHandler();
+        $handler = $this->handler();
         $request = $this->request()->withAttribute('correlationId', $attribute);
 
         $response = $this->middleware()->process($request, $handler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
-        Assert::same($this->generator->calls, 1);
+        Assert::same($this->handledRequest($handler)->getAttribute('correlationId'), self::GENERATED_ID);
+        verify(fn() => $this->generator->generate(), times: 1);
     }
 
     public static function unadoptableAttributeProvider(): iterable
@@ -511,7 +475,7 @@ final class CorrelationIdMiddlewareTest
     #[DataProvider('bothAnchorsProvider')]
     public function rejectsATrailingNewlineUnderEitherAnchor(string $validationPattern): void
     {
-        $handler = new FakeHandler();
+        $handler = $this->handler();
         // nyholm's own header-value check is `$`-anchored, so a single
         // trailing `\n` really does reach the middleware.
         $request = $this->request(self::INCOMING_ID . "\n");
@@ -519,8 +483,8 @@ final class CorrelationIdMiddlewareTest
         $response = $this->middleware(validationPattern: $validationPattern)->process($request, $handler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
-        Assert::same($this->generator->calls, 1);
+        Assert::same($this->handledRequest($handler)->getAttribute('correlationId'), self::GENERATED_ID);
+        verify(fn() => $this->generator->generate(), times: 1);
     }
 
     /**
@@ -531,14 +495,14 @@ final class CorrelationIdMiddlewareTest
     #[DataProvider('bothAnchorsProvider')]
     public function refusesToAdoptAnAttributeWithATrailingNewlineUnderEitherAnchor(string $validationPattern): void
     {
-        $handler = new FakeHandler();
+        $handler = $this->handler();
         $request = $this->request()->withAttribute('correlationId', self::INCOMING_ID . "\n");
 
         $response = $this->middleware(validationPattern: $validationPattern)->process($request, $handler);
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
-        Assert::same($handler->handledRequest?->getAttribute('correlationId'), self::GENERATED_ID);
-        Assert::same($this->generator->calls, 1);
+        Assert::same($this->handledRequest($handler)->getAttribute('correlationId'), self::GENERATED_ID);
+        verify(fn() => $this->generator->generate(), times: 1);
     }
 
     /**
@@ -578,8 +542,8 @@ final class CorrelationIdMiddlewareTest
     #[DataProvider('controlCharacterProvider')]
     public function rejectsAGeneratedIdCarryingAControlCharacterUnderAPermissivePattern(string $generated): void
     {
-        $this->generator = new FixedGenerator($generated);
-        $handler = new FakeHandler();
+        $this->generator = $this->fixedGenerator($generated);
+        $handler = $this->handler();
 
         Expect::exception(UnexpectedValueException::class)
             ->withMessageContaining('does not satisfy validationPattern and maxLength');
@@ -587,7 +551,7 @@ final class CorrelationIdMiddlewareTest
         try {
             $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)->process($this->request(), $handler);
         } finally {
-            Assert::null($handler->handledRequest);
+            Understudy::unused($handler);
         }
     }
 
@@ -608,10 +572,10 @@ final class CorrelationIdMiddlewareTest
     #[DataProvider('controlFreeIdProvider')]
     public function acceptsAControlFreeIdUnderAPermissivePattern(string $generated): void
     {
-        $this->generator = new FixedGenerator($generated);
+        $this->generator = $this->fixedGenerator($generated);
 
         $response = $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)
-            ->process($this->request(), new FakeHandler());
+            ->process($this->request(), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), $generated);
     }
@@ -627,10 +591,10 @@ final class CorrelationIdMiddlewareTest
     #[DataProvider('incomingControlCharacterProvider')]
     public function rejectsAnIncomingIdCarryingAControlCharacterUnderAPermissivePattern(string $incoming): void
     {
-        $this->generator = new FixedGenerator('generated-id');
+        $this->generator = $this->fixedGenerator('generated-id');
 
         $response = $this->middleware(validationPattern: self::PERMISSIVE_PATTERN)
-            ->process($this->request($incoming), new FakeHandler());
+            ->process($this->request($incoming), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), 'generated-id');
     }
@@ -646,7 +610,7 @@ final class CorrelationIdMiddlewareTest
 
     public function overwritesAnIdHeaderSetDownstream(): void
     {
-        $handler = new FakeHandler();
+        $handler = $this->handler();
 
         $response = $this->middleware()->process($this->request(self::INCOMING_ID), $handler);
 
@@ -658,17 +622,17 @@ final class CorrelationIdMiddlewareTest
         $middleware = $this->middleware(validationPattern: '/^[0-9A-Z]{26}$/');
         $ulid = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 
-        $response = $middleware->process($this->request($ulid), new FakeHandler());
+        $response = $middleware->process($this->request($ulid), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), $ulid);
     }
 
     public function rejectsIncomingIdLongerThanConfiguredMaxLength(): void
     {
-        $this->generator = new FixedGenerator('generated');
+        $this->generator = $this->fixedGenerator('generated');
         $middleware = $this->middleware(validationPattern: '/^[a-z-]+$/', maxLength: 9);
 
-        $response = $middleware->process($this->request('incoming-id'), new FakeHandler());
+        $response = $middleware->process($this->request('incoming-id'), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), 'generated');
     }
@@ -677,7 +641,7 @@ final class CorrelationIdMiddlewareTest
     {
         $middleware = $this->middleware(maxLength: strlen(self::INCOMING_ID));
 
-        $response = $middleware->process($this->request(self::INCOMING_ID), new FakeHandler());
+        $response = $middleware->process($this->request(self::INCOMING_ID), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::INCOMING_ID);
     }
@@ -693,7 +657,7 @@ final class CorrelationIdMiddlewareTest
     {
         $middleware = $this->middleware(validationPattern: '/^[a-z]$/', maxLength: 1);
 
-        $response = $middleware->process($this->request('x'), new FakeHandler());
+        $response = $middleware->process($this->request('x'), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), 'x');
     }
@@ -709,7 +673,7 @@ final class CorrelationIdMiddlewareTest
     {
         $middleware = $this->middleware(validationPattern: '/^.*$/');
 
-        $response = $middleware->process($this->request(), new FakeHandler());
+        $response = $middleware->process($this->request(), $this->handler());
 
         Assert::same($response->getHeaderLine('X-Request-ID'), self::GENERATED_ID);
     }
@@ -717,8 +681,8 @@ final class CorrelationIdMiddlewareTest
     #[DataProvider('unacceptableGeneratedIdProvider')]
     public function rejectsUnacceptableGeneratedIdBeforeCallingTheHandler(string $generated): void
     {
-        $this->generator = new FixedGenerator($generated);
-        $handler = new FakeHandler();
+        $this->generator = $this->fixedGenerator($generated);
+        $handler = $this->handler();
 
         Expect::exception(UnexpectedValueException::class)
             ->withMessageContaining('does not satisfy validationPattern and maxLength');
@@ -726,7 +690,7 @@ final class CorrelationIdMiddlewareTest
         try {
             $this->middleware()->process($this->request(), $handler);
         } finally {
-            Assert::null($handler->handledRequest);
+            Understudy::unused($handler);
             Assert::null($this->holder->tryGet());
         }
     }
@@ -753,7 +717,7 @@ final class CorrelationIdMiddlewareTest
 
         $response = $middleware->process(
             (new ServerRequest('GET', '/'))->withHeader('X-Request-ID', $incoming),
-            new FakeHandler(),
+            $this->handler(),
         );
 
         $id = $response->getHeaderLine('X-Request-ID');
@@ -798,11 +762,19 @@ final class CorrelationIdMiddlewareTest
         yield 'tab-smuggled content' => [self::INCOMING_ID . "\tX-Evil: 1"];
     }
 
+    /**
+     * A property body runs many times inside one test, so the double created
+     * there is created fresh per run and the stub re-registered each time —
+     * the adapter's reset covers the whole property, not a single run. Exact
+     * `expect()` cardinalities would count every run, example and shrink at
+     * once; a `when()` stub is the shape that stays correct here.
+     */
     #[Property(runs: 300, timeoutMs: 1000)]
     public function reusesTheIncomingIdExactlyWhenTheDefaultPatternAcceptsIt(string $incoming): void
     {
+        $generator = $this->fixedGenerator(self::GENERATED_ID);
         $middleware = new CorrelationIdMiddleware(
-            generator: new FixedGenerator(self::GENERATED_ID),
+            generator: $generator,
             holder: new CorrelationIdHolder(),
             acceptIncoming: true,
         );
@@ -816,7 +788,7 @@ final class CorrelationIdMiddlewareTest
 
         $response = $middleware->process(
             (new ServerRequest('GET', '/'))->withHeader('X-Request-ID', $incoming),
-            new FakeHandler(),
+            $this->handler(),
         );
 
         Assert::same(
@@ -859,7 +831,7 @@ final class CorrelationIdMiddlewareTest
     public function maxLengthRejectsAnIncomingIdTheCustomPatternWouldAccept(string $incoming, int $maxLength): void
     {
         $middleware = new CorrelationIdMiddleware(
-            generator: new FixedGenerator('generated'),
+            generator: $this->fixedGenerator('generated'),
             holder: new CorrelationIdHolder(),
             acceptIncoming: true,
             validationPattern: self::LOWERCASE_PATTERN,
@@ -875,7 +847,7 @@ final class CorrelationIdMiddlewareTest
 
         $response = $middleware->process(
             (new ServerRequest('GET', '/'))->withHeader('X-Request-ID', $incoming),
-            new FakeHandler(),
+            $this->handler(),
         );
 
         Assert::same($response->getHeaderLine('X-Request-ID'), $withinLimit ? $incoming : 'generated');
@@ -992,6 +964,82 @@ final class CorrelationIdMiddlewareTest
         }
 
         return true;
+    }
+
+    /**
+     * A generator double answering one fixed ID — the understudy replacement
+     * for the hand-written `FixedGenerator` spy, with the call count read
+     * back through `verify()` instead of a public counter.
+     */
+    private function fixedGenerator(string $id): CorrelationIdGenerator
+    {
+        $generator = Understudy::for(CorrelationIdGenerator::class);
+        when(fn() => $generator->generate())->returns($id);
+
+        return $generator;
+    }
+
+    /**
+     * A generator double answering a different ID per call, so a test can
+     * tell whether two middleware instances agreed on one ID or each minted
+     * its own. `returns(a, b)` hands out one value per call and the last one
+     * repeats, so a second mint surfaces both in the answer and in the
+     * `verify(..., times: 1)` claim beside it.
+     */
+    private function sequencedGenerator(string ...$ids): CorrelationIdGenerator
+    {
+        $generator = Understudy::for(CorrelationIdGenerator::class);
+        when(fn() => $generator->generate())->returns(...$ids);
+
+        return $generator;
+    }
+
+    /**
+     * A handler double answering 200 and recording every request it served;
+     * `handledRequest()` reads the last one back from the call log.
+     */
+    private function handler(): RequestHandlerInterface
+    {
+        $handler = Understudy::for(RequestHandlerInterface::class);
+        when(fn() => $handler->handle(Arg::any()))->returns(new Response(200));
+
+        return $handler;
+    }
+
+    /**
+     * @param Closure():(void|ResponseInterface) $spy runs while the request is
+     *                                                  still in flight — the place to observe the holder
+     */
+    private function observingHandler(\Closure $spy): RequestHandlerInterface
+    {
+        $handler = Understudy::for(RequestHandlerInterface::class);
+        when(fn() => $handler->handle(Arg::any()))
+            ->answers(function () use ($spy): ResponseInterface {
+                $spy();
+
+                return new Response(200);
+            });
+
+        return $handler;
+    }
+
+    private function throwingHandler(): RequestHandlerInterface
+    {
+        $handler = Understudy::for(RequestHandlerInterface::class);
+        when(fn() => $handler->handle(Arg::any()))->throws(new RuntimeException('downstream failure'));
+
+        return $handler;
+    }
+
+    /**
+     * The request the handler served last, read back from the double's call
+     * log — the replacement for the old fake's `handledRequest` property.
+     */
+    private function handledRequest(RequestHandlerInterface $handler): ServerRequestInterface
+    {
+        $calls = Understudy::calls(fn() => $handler->handle(Arg::any()));
+
+        return $calls[count($calls) - 1]->args[0];
     }
 
     /**
