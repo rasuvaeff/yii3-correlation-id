@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Mutation testing now counts code the tests execute without naming it in `#[Covers]`
+  (`infection --with-uncovered`), with `PublicVisibility` off and signature defaults ignored
+  as in the monorepo template; overall MSI 100%. No `src/` or test changes.
 - The middleware test suite doubles its collaborators with
   `rasuvaeff/understudy` (Testo adapter: `rasuvaeff/understudy-testo`) instead
   of hand-written spies: the `FixedGenerator` call counter became
