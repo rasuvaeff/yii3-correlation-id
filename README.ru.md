@@ -18,7 +18,7 @@ context-провайдер `yiisoft/log`. Каждый запрос получа
 
 ## Требования
 
-- PHP 8.3+
+- PHP 8.3 – 8.6
 - `psr/http-message` ^2.0, `psr/http-server-middleware` ^1.0
 - `yiisoft/log` ^2.1 (API `ContextProvider` появился в 2.1.0)
 

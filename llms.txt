@@ -12,7 +12,7 @@ composer require rasuvaeff/yii3-correlation-id
 
 ## Rules
 
-- PHP 8.3+, `declare(strict_types=1)`, namespace `Rasuvaeff\Yii3CorrelationId`
+- PHP 8.3 – 8.6, `declare(strict_types=1)`, namespace `Rasuvaeff\Yii3CorrelationId`
 - `CorrelationIdHolder` must be ONE shared instance (DI autowires it; the
   package deliberately does not bind it). Different instances = the middleware
   writes one holder and readers read another, silently empty.
