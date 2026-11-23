@@ -17,7 +17,7 @@ it, and the client gets it back in the response header.
 
 ## Requirements
 
-- PHP 8.3+
+- PHP 8.3 – 8.6
 - `psr/http-message` ^2.0, `psr/http-server-middleware` ^1.0
 - `yiisoft/log` ^2.1 (2.1.0 introduced the `ContextProvider` API)
 
