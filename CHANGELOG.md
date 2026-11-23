@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 2.1.0 — 2026-11-23
 
 - Enh #21: Add PHP 8.6 support. The `php` constraint is widened to `8.3 - 8.6`; CI runs PHP 8.6 as a regular matrix entry, and the backward-compatibility job moves to PHP 8.5.
 - Mutation testing now counts code the tests execute without naming it in `#[Covers]`
